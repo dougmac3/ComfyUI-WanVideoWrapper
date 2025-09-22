@@ -80,63 +80,95 @@ def merge_final(vert_attr: torch.Tensor, weight: torch.Tensor, vert_assign: torc
     return final_attr
 
 
-def patch_motion(
-    tracks: torch.FloatTensor,  # (B, T, N, 4)
-    vid: torch.FloatTensor,  # (C, T, H, W)
-    temperature: float = 220.0,
-    vae_divide: tuple = (4, 16),
-    topk: int = 2,
-):
+def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
+    """
+    tracks: (B, T, N, 4)  where last dim = [mask(1), x(1), y(1), visible(1)]
+            (some builds use [mask, x, y, visible], some [dummy, x, y, visible])
+    vid:    (C, T, H, W)
+    Returns: (C + vae_divide[0], T, H, W)   # mask channels prepended as in your pipeline
+    """
+    import torch
+    import torch.nn.functional as F
+
     with torch.no_grad():
-        _, T, H, W = vid.shape
+        C, T, H, W = vid.shape
+        B = tracks.shape[0]
         N = tracks.shape[2]
-        _, tracks, visible = torch.split(
-            tracks, [1, 2, 1], dim=-1
-        )  # (B, T, N, 2) | (B, T, N, 1)
-        tracks_n = tracks / torch.tensor([W / min(H, W), H / min(H, W)], device=tracks.device)
-        tracks_n = tracks_n.clamp(-1, 1)
-        visible = visible.clamp(0, 1)
 
-        xx = torch.linspace(-W / min(H, W), W / min(H, W), W)
-        yy = torch.linspace(-H / min(H, W), H / min(H, W), H)
+        # Split to (B, T, N, 2) coords and (B, T, N, 1) visibility
+        # Your tracks have 4 at the end; we keep the middle two as (x,y) and last as visible.
+        _, xy, visible = torch.split(tracks, [1, 2, 1], dim=-1)  # xy: (B,T,N,2) | visible: (B,T,N,1)
 
-        grid = torch.stack(torch.meshgrid(yy, xx, indexing="ij")[::-1], dim=-1).to(
-            tracks.device
-        )
+        # Normalize coords to [-1,1] in the same way your original code did
+        s = float(min(H, W))
+        norm = torch.tensor([W / s, H / s], device=tracks.device, dtype=vid.dtype)
+        xy_n = (xy / norm).clamp(-1, 1)  # (B,T,N,2)
+        visible = visible.clamp(0, 1)    # (B,T,N,1)
 
-        tracks_pad = tracks[:, 1:]
-        visible_pad = visible[:, 1:]
+        # Build grid (H,W,2) on the right device/dtype
+        xx = torch.linspace(-W / s, W / s, W, device=vid.device, dtype=vid.dtype)
+        yy = torch.linspace(-H / s, H / s, H, device=vid.device, dtype=vid.dtype)
+        grid = torch.stack(torch.meshgrid(yy, xx, indexing="ij")[::-1], dim=-1)  # (H,W,2)
 
-        visible_align = visible_pad.view(T - 1, 4, *visible_pad.shape[2:]).sum(1)
-        tracks_align = (tracks_pad * visible_pad).view(T - 1, 4, *tracks_pad.shape[2:]).sum(
-            1
-        ) / (visible_align + 1e-5)
-        dist_ = (
-            (tracks_align[:, None, None] - grid[None, :, :, None]).pow(2).sum(-1)
-        )  # T, H, W, N
-        weight = torch.exp(-dist_ * temperature) * visible_align.clamp(0, 1).view(
-            T - 1, 1, 1, N
-        )
-        vert_weight, vert_index = torch.topk(
-            weight, k=min(topk, weight.shape[-1]), dim=-1
-        )
+        # Drop the first frame for alignment against (T-1)
+        xy_pad = xy[:, 1:]           # (B, T-1, N, 2)
+        vis_pad = visible[:, 1:]     # (B, T-1, N, 1)
+        Tm1 = vis_pad.shape[1]       # <-- correct time length (T-1)
+        Tcalc = Tm1 + 1              # just for clarity
 
+        # Reduce over batch (works for B==1 and B>1)
+        if B == 1:
+            vis_sum = vis_pad.squeeze(0)                 # (T-1, N, 1)
+            xy_sum  = (xy_pad.squeeze(0) * vis_sum)      # (T-1, N, 2)
+        else:
+            vis_sum = vis_pad.sum(0)                     # (T-1, N, 1)
+            xy_sum  = (xy_pad * vis_pad).sum(0)          # (T-1, N, 2)
+
+        # Weighted mean positions where visible>0
+        eps = 1e-5
+        align_vis = vis_sum                               # (T-1, N, 1)
+        align_xy  = xy_sum / (align_vis + eps)            # (T-1, N, 2)
+
+        # Distance field to each track point (broadcast to (T-1,H,W,N))
+        # (T-1,N,2) vs (H,W,2) -> (T-1,H,W,N,2) -> sum over last
+        diff = align_xy[:, None, None, :, :] - grid[None, :, :, None, :]   # (T-1,H,W,N,2)
+        dist = (diff * diff).sum(-1)                                       # (T-1,H,W,N)
+
+        # Convert to weights and keep only visible tracks
+        vis_mask = align_vis.squeeze(-1)                    # (T-1, N)
+        weight = torch.exp(-dist * temperature) * vis_mask[:, None, None, :]  # (T-1,H,W,N)
+
+        # Top-k over tracks (N)
+        k = min(int(topk), weight.shape[-1])
+        vert_weight, vert_index = torch.topk(weight, k=k, dim=-1)           # (T-1,H,W,k), (T-1,H,W,k)
+
+    # Sample a per-track feature at the FIRST time step (kept to match your current behavior)
     grid_mode = "bilinear"
-    point_feature = torch.nn.functional.grid_sample(
-        vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1],
-        tracks_n[:, :1].type(vid.dtype),
+    # vid: (C,T,H,W) -> (T,C,H,W) to grid_sample per time
+    # You only use frame 0 features for all tracks; leaving this identical to your pipeline.
+    point_feature = F.grid_sample(
+        vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1],       # (1,C,H,W)
+        xy_n[:, :1].type(vid.dtype),                       # (B,1,N,2) -> treated as (N,2) per grid_sample batching
         mode=grid_mode,
         padding_mode="zeros",
         align_corners=False,
     )
-    point_feature = point_feature.squeeze(0).squeeze(1).permute(1, 0) # N, C=16
+    # -> (1,C,1,N)  squeeze to (N,C)
+    point_feature = point_feature.squeeze(0).squeeze(1).permute(1, 0)       # (N, C)
 
-    out_feature = merge_final(point_feature, vert_weight, vert_index).permute(3, 0, 1, 2) # T - 1, H, W, C => C, T - 1, H, W
-    out_weight = vert_weight.sum(-1) # T - 1, H, W
+    # Merge back to per-pixel features (your existing helper)
+    out_feature = merge_final(point_feature, vert_weight, vert_index).permute(3, 0, 1, 2)  # (C,T-1,H,W)
+    out_weight  = vert_weight.sum(-1)                                                     # (T-1,H,W)
 
-    # out feature -> already soft weighted
-    mix_feature = out_feature + vid[vae_divide[0]:, 1:] * (1 - out_weight.clamp(0, 1))
+    # Soft blend with original latent features (unchanged behavior)
+    mix_feature = out_feature + vid[vae_divide[0]:, 1:] * (1 - out_weight.clamp(0, 1))   # (C,T-1,H,W)
 
-    out_feature_full = torch.cat([vid[vae_divide[0]:, :1], mix_feature], dim=1) # C, T, H, W
-    out_mask_full = torch.cat([torch.ones_like(out_weight[:1]), out_weight], dim=0)  # T, H, W
-    return torch.cat([out_mask_full[None].expand(vae_divide[0], -1, -1, -1), out_feature_full], dim=0)
+    # Re-attach the first frame
+    out_feature_full = torch.cat([vid[vae_divide[0]:, :1], mix_feature], dim=1)          # (C,T,H,W)
+    out_mask_full    = torch.cat([torch.ones_like(out_weight[:1]), out_weight], dim=0)   # (T,H,W)
+
+    # Prepend mask channels for the VAE split as your pipeline expects
+    return torch.cat(
+        [out_mask_full[None].expand(vae_divide[0], -1, -1, -1), out_feature_full],
+        dim=0
+    )
