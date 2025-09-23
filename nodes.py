@@ -24,8 +24,6 @@ from .taehv import TAEHV
 from contextlib import nullcontext
 from einops import rearrange
 
-from .ATI.motion_patch import patch_motion as ati_patch_motion
-
 from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale, load_torch_file
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
@@ -44,6 +42,16 @@ try:
     from .gguf.gguf import GGUFParameter
 except:
     pass
+
+# add this with the other imports in ComfyUI-WanVideoWrapper/nodes.py
+try:
+    from .ATI import motion_patch as ati_motion
+except Exception:
+    import importlib
+    ati_motion = importlib.import_module(
+        "custom_nodes.ComfyUI-WanVideoWrapper.ATI.motion_patch"
+    )
+
 
 class MetaParameter(torch.nn.Parameter):
     def __new__(cls, dtype, quant_type=None):
