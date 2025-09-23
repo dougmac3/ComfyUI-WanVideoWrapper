@@ -24,6 +24,8 @@ from .taehv import TAEHV
 from contextlib import nullcontext
 from einops import rearrange
 
+from .ATI.motion_patch import patch_motion as ati_patch_motion
+
 from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale, load_torch_file
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
@@ -1941,7 +1943,8 @@ class WanVideoSampler:
                     temperature = transformer_options.get("ati_temperature", 220.0)
                     ati_start_percent = transformer_options.get("ati_start_percent", 0.0)
                     ati_end_percent = transformer_options.get("ati_end_percent", 1.0)
-                    image_cond_ati = patch_motion(ATI_tracks.to(image_cond.device, image_cond.dtype), image_cond, topk=topk, temperature=temperature)
+                    image_cond_ati = ati_motion.patch_motion(ATI_tracks.to(image_cond.device, image_cond.dtype),
+                                         image_cond, topk=topk, temperature=temperature)
                     log.info(f"ATI tracks shape: {ATI_tracks.shape}")
             
             add_cond_latents = image_embeds.get("add_cond_latents", None)
