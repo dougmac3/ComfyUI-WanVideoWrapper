@@ -1,3 +1,5 @@
+print(">>> USING motion_patch FROM:", __file__)
+
 import torch
 import torch.nn.functional as F
 
@@ -24,6 +26,8 @@ def _weighted_gather_fuse(point_feature, vert_weight, vert_index):
 
 @torch.inference_mode()
 def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
+    print(">>> patch_motion ACTIVE | shapes:",
+      "tracks", tuple(tracks.shape), "| vid", tuple(vid.shape))
     """
     Robust ATI motion patch that tolerates sampler/ATI step mismatches.
     tracks: (B, T, N, 4) last dim = [mask_or_dummy, x, y, visible] (mask is ignored)

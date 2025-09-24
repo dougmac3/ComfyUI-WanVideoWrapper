@@ -1946,7 +1946,7 @@ class WanVideoSampler:
             if transformer_options is not None:
                 ATI_tracks = transformer_options.get("ati_tracks", None)
                 if ATI_tracks is not None:
-                    from .ATI.motion_patch import patch_motion
+                    from .ATI import motion_patch as ati_motion
                     topk = transformer_options.get("ati_topk", 2)
                     temperature = transformer_options.get("ati_temperature", 220.0)
                     ati_start_percent = transformer_options.get("ati_start_percent", 0.0)
