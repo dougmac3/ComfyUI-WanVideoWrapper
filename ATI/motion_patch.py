@@ -25,6 +25,7 @@ def _weighted_gather_fuse(point_feature, vert_weight, vert_index):
     return fused.permute(3, 0, 1, 2).contiguous()
 
 @torch.inference_mode()
+@torch.inference_mode()
 def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
     """
     tracks: (B, T, N, 4)  last dim = [mask_or_dummy, x, y, visible]
@@ -78,49 +79,54 @@ def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
         k = int(min(max(1, topk), weight.shape[-1]))
         vert_weight, vert_index = torch.topk(weight, k=k, dim=-1)  # (T-1,H,W,k)
 
-    # ================ SAFER POINT-FEATURE EXTRACTION (NO PERMUTE ON SPARSE) ================
-    # Sample features from the first time slice (consistent with your pipeline)
-    x_in = vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1]  # (1, C, H, W)
-    g_in = xy_n[:, :1]                                  # (B, 1, N, 2)
-    grid_ = g_in.reshape(1, 1, N, 2)                    # (1, 1, N, 2)
+    # === SAFER POINT-FEATURE EXTRACTION (no hidden permutes on sparse) ===
+    # Prepare inputs for grid_sample
+    x_in = vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1]    # (1, C, H, W)  -- always strided
+    g_in = xy_n[:, :1]                                    # (B, 1, N, 2)
+
+    # Forced dtype/device match and strided layout
+    if hasattr(x_in, "layout") and x_in.layout != torch.strided:
+        x_in = x_in.to_dense()
+    x_in = x_in.contiguous()
+
+    grid_ = g_in.reshape(1, 1, N, 2).to(dtype=x_in.dtype, device=x_in.device)  # (1,1,N,2)
+    if hasattr(grid_, "layout") and grid_.layout != torch.strided:
+        grid_ = grid_.to_dense()
+    grid_ = grid_.contiguous()
 
     pt = F.grid_sample(
-        x_in, grid_.to(dtype=x_in.dtype),
+        x_in, grid_,
         mode="bilinear", padding_mode="zeros", align_corners=False
-    )
-    # Expect (1, C, 1, N). Make dense if needed, then index directly to avoid reshape/permute pitfalls.
-    if pt.is_sparse:
+    )  # -> (1, C, 1, N)
+
+    # Force dense/strided before any transpose-like op
+    if hasattr(pt, "layout") and pt.layout != torch.strided:
         pt = pt.to_dense()
     pt = pt.contiguous()
 
-    if pt.dim() == 4 and pt.shape[0] == 1 and pt.shape[2] == 1:
-        # (1, C, 1, N) -> (C, N)
-        pt_cn = pt[0, :, 0, :]
-    elif pt.dim() == 3 and pt.shape[1] == 1:
-        # (C, 1, N) -> (C, N)
-        pt_cn = pt[:, 0, :]
-    elif pt.dim() == 2:
-        # Already (C, N)
-        pt_cn = pt
-    else:
-        # Fallback: flatten last two dims safely into N*, then slice back to N when possible
-        pt_cn = pt.reshape(pt.shape[1], -1)
+    # Extract as (C, N) WITHOUT permute on a sparse tensor
+    # (1,C,1,N) -> (C,N) by direct indexing then contiguous
+    point_feature_CN = pt[0, :, 0, :].contiguous()        # (C, N)
+    if hasattr(point_feature_CN, "layout") and point_feature_CN.layout != torch.strided:
+        point_feature_CN = point_feature_CN.to_dense()
+    point_feature_CN = point_feature_CN.contiguous()
 
-    point_feature = pt_cn.transpose(0, 1).contiguous()  # (N, C)
-    # =====================================================================
+    # Transpose on a guaranteed-dense tensor to (N, C)
+    point_feature = point_feature_CN.transpose(0, 1).contiguous()  # (N, C)
 
     # Merge per-pixel using provided helper
     out_feature = merge_final(point_feature, vert_weight, vert_index).permute(3, 0, 1, 2)  # (C,T-1,H,W)
-    out_weight  = vert_weight.sum(-1)                                                      # (T-1,H,W)
+    out_weight  = vert_weight.sum(-1)                                                     # (T-1,H,W)
 
     # Blend with original features and reattach first frame
     mix_feature      = out_feature + vid[vae_divide[0]:, 1:] * (1 - out_weight.clamp(0, 1))
-    out_feature_full = torch.cat([vid[vae_divide[0]:, :1], mix_feature], dim=1)            # (C,T,H,W)
-    out_mask_full    = torch.cat([torch.ones_like(out_weight[:1]), out_weight], dim=0)     # (T,H,W)
+    out_feature_full = torch.cat([vid[vae_divide[0]:, :1], mix_feature], dim=1)          # (C,T,H,W)
+    out_mask_full    = torch.cat([torch.ones_like(out_weight[:1]), out_weight], dim=0)   # (T,H,W)
 
     # Prepend mask channels for VAE split
     return torch.cat(
         [out_mask_full[None].expand(vae_divide[0], -1, -1, -1), out_feature_full],
         dim=0
     )
+
 
