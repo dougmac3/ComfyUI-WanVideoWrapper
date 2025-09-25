@@ -78,28 +78,36 @@ def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
         k = int(min(max(1, topk), weight.shape[-1]))
         vert_weight, vert_index = torch.topk(weight, k=k, dim=-1)  # (T-1,H,W,k)
 
-    # --- Robust point-feature extraction (sparse-safe, shape-agnostic) ---
-    # Sample features from the first time slice (keeps behavior aligned with existing pipeline)
+    # ================ SAFER POINT-FEATURE EXTRACTION (NO PERMUTE ON SPARSE) ================
+    # Sample features from the first time slice (consistent with your pipeline)
     x_in = vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1]  # (1, C, H, W)
     g_in = xy_n[:, :1]                                  # (B, 1, N, 2)
-
-    # grid_sample expects grid: (N_in, H_out, W_out, 2); we treat N as "W_out"
     grid_ = g_in.reshape(1, 1, N, 2)                    # (1, 1, N, 2)
 
     pt = F.grid_sample(
         x_in, grid_.to(dtype=x_in.dtype),
         mode="bilinear", padding_mode="zeros", align_corners=False
-    )  # expected (1, C, 1, N)
-
-    # Coerce to dense if any upstream path produced sparse
+    )
+    # Expect (1, C, 1, N). Make dense if needed, then index directly to avoid reshape/permute pitfalls.
     if pt.is_sparse:
         pt = pt.to_dense()
+    pt = pt.contiguous()
 
-    # Make contiguous and collapse to (N, C) robustly:
-    # (1, C, 1, N) -> reshape to (1, C, N) -> mean over batch -> (C, N) -> (N, C)
-    pt = pt.contiguous().reshape(pt.shape[0], pt.shape[1], -1)  # (B, C, N*)
-    pt = pt.mean(dim=0, keepdim=False)                          # (C, N)
-    point_feature = pt.transpose(0, 1).contiguous()             # (N, C)
+    if pt.dim() == 4 and pt.shape[0] == 1 and pt.shape[2] == 1:
+        # (1, C, 1, N) -> (C, N)
+        pt_cn = pt[0, :, 0, :]
+    elif pt.dim() == 3 and pt.shape[1] == 1:
+        # (C, 1, N) -> (C, N)
+        pt_cn = pt[:, 0, :]
+    elif pt.dim() == 2:
+        # Already (C, N)
+        pt_cn = pt
+    else:
+        # Fallback: flatten last two dims safely into N*, then slice back to N when possible
+        pt_cn = pt.reshape(pt.shape[1], -1)
+
+    point_feature = pt_cn.transpose(0, 1).contiguous()  # (N, C)
+    # =====================================================================
 
     # Merge per-pixel using provided helper
     out_feature = merge_final(point_feature, vert_weight, vert_index).permute(3, 0, 1, 2)  # (C,T-1,H,W)
@@ -115,3 +123,4 @@ def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
         [out_mask_full[None].expand(vae_divide[0], -1, -1, -1), out_feature_full],
         dim=0
     )
+
