@@ -97,7 +97,10 @@ def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
         align_corners=False,
     )
     # -> (1,C,1,N) -> (N,C)
-    point_feature = pt.squeeze(0).squeeze(0).permute(1, 0).contiguous()
+    pt = pt.squeeze(0)                                  # -> (C, H_out, W_out)
+    pt = pt.contiguous()                                # ensure dense/contiguous
+    pt = pt.reshape(pt.shape[0], -1).contiguous()       # -> (C, N=H_out*W_out)
+    point_feature = pt.transpose(0, 1).contiguous()     # -> (N, C)
 
     # Fuse: (C,T-1,H,W) without any 4-group reshape
     out_feature = _weighted_gather_fuse(point_feature, vert_weight, vert_index)  # (C,T-1,H,W)
