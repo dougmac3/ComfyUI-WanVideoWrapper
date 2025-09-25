@@ -68,20 +68,20 @@ def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
 
         # Visibility / weighted xy across batch
         if B == 1:
-            vis_sum = _to_strided(vis_pad.squeeze(0))           # (T-1,N,1)
-            xy_sum  = _to_strided((xy_pad.squeeze(0) * vis_sum))# (T-1,N,2)
+            vis_sum = _to_strided(vis_pad.squeeze(0))            # (T-1,N,1)
+            xy_sum  = _to_strided((xy_pad.squeeze(0) * vis_sum)) # (T-1,N,2)
         else:
-            vis_sum = _to_strided(vis_pad.sum(0))               # (T-1,N,1)
-            xy_sum  = _to_strided((xy_pad * vis_pad).sum(0))    # (T-1,N,2)
+            vis_sum = _to_strided(vis_pad.sum(0))                # (T-1,N,1)
+            xy_sum  = _to_strided((xy_pad * vis_pad).sum(0))     # (T-1,N,2)
 
         eps = 1e-5
-        align_vis = vis_sum                                     # (T-1,N,1)
-        align_xy  = _to_strided(xy_sum / (align_vis + eps))     # (T-1,N,2)
+        align_vis = vis_sum                                      # (T-1,N,1)
+        align_xy  = _to_strided(xy_sum / (align_vis + eps))      # (T-1,N,2)
 
         # Distance -> weights (T-1,H,W,N)
         diff  = _to_strided(align_xy[:, None, None, :, :] - grid[None, :, :, None, :])
         dist  = _to_strided((diff * diff).sum(-1))
-        vmask = _to_strided(align_vis.squeeze(-1))              # (T-1,N)
+        vmask = _to_strided(align_vis.squeeze(-1))               # (T-1,N)
         weight = _to_strided(torch.exp(-dist * temperature) * vmask[:, None, None, :])
 
         # Top-k over tracks
@@ -91,39 +91,35 @@ def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
         vert_index  = _to_strided(vert_index)
 
     # === Point-feature extraction on frame 0 ===
-    # x0_in: (1,C,H,W)
-    x0_in = _to_strided(vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1])
-    # grid_: (1,1,N,2) in [-1,1] (same normalization as xy_n)
-    grid_ = _to_strided(xy_n[:, :1].reshape(1, 1, N, 2).to(dtype=x0_in.dtype, device=x0_in.device))
+    x0_in = _to_strided(vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1])       # (1,C,H,W)
+    grid_ = _to_strided(xy_n[:, :1].reshape(1, 1, N, 2).to(x0_in.dtype))   # (1,1,N,2)
 
-    # Try grid_sample first; if it trips sparse/permute inside ATen, fall back to manual NN gather
+    # Try grid_sample; on failure, fallback to manual NN gather (marker below).
     try:
         pt = F.grid_sample(
             x0_in, grid_,
             mode="bilinear", padding_mode="zeros", align_corners=False
         )  # -> (1, C, 1, N)
         pt = _to_strided(pt)
-        # Extract (N,C) without any permute on sparse
         point_feature = _to_strided(pt[0, :, 0, :]).transpose(0, 1)  # (N,C)
-    except Exception as e:
-        # Fallback: nearest-neighbor from frame-0 features (C,H,W) -> (N,C)
+    except Exception:
+        # FALLBACK_MARKER: nearest-neighbor gather to avoid sparse permute paths
         x0 = _to_strided(vid[vae_divide[0]:, 0])   # (C,H,W)
-        # Convert xy_n in [-1,1] to pixel coords
-        # NOTE: xy_n is in normalized (x,y). Map to [0..W-1], [0..H-1].
-        xy0 = _to_strided(xy_n[:, 0, :, :])        # (B=1, N, 2) -> (1,N,2)
+
+        # Convert normalized coords to pixel indices
+        xy0 = _to_strided(xy_n[:, 0, :, :])        # (B=1,N,2) -> (1,N,2)
         if xy0.dim() == 3 and xy0.shape[0] == 1:
             xy0 = xy0[0]                           # (N,2)
-        # from [-1,1] to pixel index
         px = ((xy0[..., 0] + 1) * 0.5) * (W - 1)
         py = ((xy0[..., 1] + 1) * 0.5) * (H - 1)
         px = torch.clamp(px.round().long(), 0, W - 1)
         py = torch.clamp(py.round().long(), 0, H - 1)
-        # Advanced index gather -> (N,C)
+
         point_feature = _to_strided(x0[:, py, px].transpose(0, 1))  # (N,C)
 
     # Merge per-pixel using helper
     out_feature = _to_strided(merge_final(point_feature, vert_weight, vert_index).permute(3, 0, 1, 2))  # (C,T-1,H,W)
-    out_weight  = _to_strided(vert_weight.sum(-1))                                                      # (T-1,H/W)
+    out_weight  = _to_strided(vert_weight.sum(-1))                                                      # (T-1,H,W)
 
     # Blend & reattach first frame
     mix_feature      = _to_strided(out_feature + vid[vae_divide[0]:, 1:] * (1 - out_weight.clamp(0, 1)))
