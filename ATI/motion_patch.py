@@ -25,7 +25,6 @@ def _weighted_gather_fuse(point_feature, vert_weight, vert_index):
     return fused.permute(3, 0, 1, 2).contiguous()
 
 @torch.inference_mode()
-@torch.inference_mode()
 def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
     """
     tracks: (B, T, N, 4)  last dim = [mask_or_dummy, x, y, visible]
@@ -35,95 +34,103 @@ def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
     import torch
     import torch.nn.functional as F
 
+    def _to_strided(x):
+        # Force dense+contiguous if needed
+        if hasattr(x, "layout") and x.layout != torch.strided:
+            x = x.to_dense()
+        return x.contiguous()
+
     with torch.no_grad():
+        # ---- sanitize inputs ----
+        vid     = _to_strided(vid)
+        tracks  = _to_strided(tracks)
+
         C, T, H, W = vid.shape
         B = tracks.shape[0]
         N = tracks.shape[2]
 
-        # Split out xy + visibility
+        # Split xy + visibility
         _, xy, visible = torch.split(tracks, [1, 2, 1], dim=-1)  # xy:(B,T,N,2), visible:(B,T,N,1)
         s = float(min(H, W))
         norm = torch.tensor([W / s, H / s], device=vid.device, dtype=vid.dtype)
         xy_n = (xy / norm).clamp(-1, 1)
         visible = visible.clamp(0, 1)
 
-        # Build normalized grid (H,W,2) for distance weighting
+        # Build normalized grid (H,W,2) used for spatial weights
         xx = torch.linspace(-W / s, W / s, W, device=vid.device, dtype=vid.dtype)
         yy = torch.linspace(-H / s, H / s, H, device=vid.device, dtype=vid.dtype)
         grid = torch.stack(torch.meshgrid(yy, xx, indexing="ij")[::-1], dim=-1)  # (H,W,2)
+        grid = _to_strided(grid)
 
         # Align to T-1
         xy_pad = xy[:, 1:]       # (B,T-1,N,2)
         vis_pad = visible[:, 1:] # (B,T-1,N,1)
 
-        # Visibility and weighted xy across batch
+        # Visibility / weighted xy across batch
         if B == 1:
-            vis_sum = vis_pad.squeeze(0)                 # (T-1,N,1)
-            xy_sum  = (xy_pad.squeeze(0) * vis_sum)      # (T-1,N,2)
+            vis_sum = _to_strided(vis_pad.squeeze(0))           # (T-1,N,1)
+            xy_sum  = _to_strided((xy_pad.squeeze(0) * vis_sum))# (T-1,N,2)
         else:
-            vis_sum = vis_pad.sum(0)                     # (T-1,N,1)
-            xy_sum  = (xy_pad * vis_pad).sum(0)          # (T-1,N,2)
+            vis_sum = _to_strided(vis_pad.sum(0))               # (T-1,N,1)
+            xy_sum  = _to_strided((xy_pad * vis_pad).sum(0))    # (T-1,N,2)
 
         eps = 1e-5
-        align_vis = vis_sum                                # (T-1,N,1)
-        align_xy  = xy_sum / (align_vis + eps)             # (T-1,N,2)
+        align_vis = vis_sum                                     # (T-1,N,1)
+        align_xy  = _to_strided(xy_sum / (align_vis + eps))     # (T-1,N,2)
 
-        # Distance to each track point -> weights
-        # (T-1,N,2) vs (H,W,2) -> (T-1,H,W,N)
-        diff  = align_xy[:, None, None, :, :] - grid[None, :, :, None, :]
-        dist  = (diff * diff).sum(-1)                      # (T-1,H,W,N)
-        vmask = align_vis.squeeze(-1)                      # (T-1,N)
-        weight = torch.exp(-dist * temperature) * vmask[:, None, None, :]  # (T-1,H,W,N)
+        # Distance -> weights (T-1,H,W,N)
+        diff  = _to_strided(align_xy[:, None, None, :, :] - grid[None, :, :, None, :])
+        dist  = _to_strided((diff * diff).sum(-1))
+        vmask = _to_strided(align_vis.squeeze(-1))              # (T-1,N)
+        weight = _to_strided(torch.exp(-dist * temperature) * vmask[:, None, None, :])
 
         # Top-k over tracks
         k = int(min(max(1, topk), weight.shape[-1]))
         vert_weight, vert_index = torch.topk(weight, k=k, dim=-1)  # (T-1,H,W,k)
+        vert_weight = _to_strided(vert_weight)
+        vert_index  = _to_strided(vert_index)
 
-    # === SAFER POINT-FEATURE EXTRACTION (no hidden permutes on sparse) ===
-    # Prepare inputs for grid_sample
-    x_in = vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1]    # (1, C, H, W)  -- always strided
-    g_in = xy_n[:, :1]                                    # (B, 1, N, 2)
+    # === Point-feature extraction on frame 0 ===
+    # x0_in: (1,C,H,W)
+    x0_in = _to_strided(vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1])
+    # grid_: (1,1,N,2) in [-1,1] (same normalization as xy_n)
+    grid_ = _to_strided(xy_n[:, :1].reshape(1, 1, N, 2).to(dtype=x0_in.dtype, device=x0_in.device))
 
-    # Forced dtype/device match and strided layout
-    if hasattr(x_in, "layout") and x_in.layout != torch.strided:
-        x_in = x_in.to_dense()
-    x_in = x_in.contiguous()
+    # Try grid_sample first; if it trips sparse/permute inside ATen, fall back to manual NN gather
+    try:
+        pt = F.grid_sample(
+            x0_in, grid_,
+            mode="bilinear", padding_mode="zeros", align_corners=False
+        )  # -> (1, C, 1, N)
+        pt = _to_strided(pt)
+        # Extract (N,C) without any permute on sparse
+        point_feature = _to_strided(pt[0, :, 0, :]).transpose(0, 1)  # (N,C)
+    except Exception as e:
+        # Fallback: nearest-neighbor from frame-0 features (C,H,W) -> (N,C)
+        x0 = _to_strided(vid[vae_divide[0]:, 0])   # (C,H,W)
+        # Convert xy_n in [-1,1] to pixel coords
+        # NOTE: xy_n is in normalized (x,y). Map to [0..W-1], [0..H-1].
+        xy0 = _to_strided(xy_n[:, 0, :, :])        # (B=1, N, 2) -> (1,N,2)
+        if xy0.dim() == 3 and xy0.shape[0] == 1:
+            xy0 = xy0[0]                           # (N,2)
+        # from [-1,1] to pixel index
+        px = ((xy0[..., 0] + 1) * 0.5) * (W - 1)
+        py = ((xy0[..., 1] + 1) * 0.5) * (H - 1)
+        px = torch.clamp(px.round().long(), 0, W - 1)
+        py = torch.clamp(py.round().long(), 0, H - 1)
+        # Advanced index gather -> (N,C)
+        point_feature = _to_strided(x0[:, py, px].transpose(0, 1))  # (N,C)
 
-    grid_ = g_in.reshape(1, 1, N, 2).to(dtype=x_in.dtype, device=x_in.device)  # (1,1,N,2)
-    if hasattr(grid_, "layout") and grid_.layout != torch.strided:
-        grid_ = grid_.to_dense()
-    grid_ = grid_.contiguous()
+    # Merge per-pixel using helper
+    out_feature = _to_strided(merge_final(point_feature, vert_weight, vert_index).permute(3, 0, 1, 2))  # (C,T-1,H,W)
+    out_weight  = _to_strided(vert_weight.sum(-1))                                                      # (T-1,H/W)
 
-    pt = F.grid_sample(
-        x_in, grid_,
-        mode="bilinear", padding_mode="zeros", align_corners=False
-    )  # -> (1, C, 1, N)
+    # Blend & reattach first frame
+    mix_feature      = _to_strided(out_feature + vid[vae_divide[0]:, 1:] * (1 - out_weight.clamp(0, 1)))
+    out_feature_full = _to_strided(torch.cat([vid[vae_divide[0]:, :1], mix_feature], dim=1))  # (C,T,H,W)
+    out_mask_full    = _to_strided(torch.cat([torch.ones_like(out_weight[:1]), out_weight], dim=0))  # (T,H,W)
 
-    # Force dense/strided before any transpose-like op
-    if hasattr(pt, "layout") and pt.layout != torch.strided:
-        pt = pt.to_dense()
-    pt = pt.contiguous()
-
-    # Extract as (C, N) WITHOUT permute on a sparse tensor
-    # (1,C,1,N) -> (C,N) by direct indexing then contiguous
-    point_feature_CN = pt[0, :, 0, :].contiguous()        # (C, N)
-    if hasattr(point_feature_CN, "layout") and point_feature_CN.layout != torch.strided:
-        point_feature_CN = point_feature_CN.to_dense()
-    point_feature_CN = point_feature_CN.contiguous()
-
-    # Transpose on a guaranteed-dense tensor to (N, C)
-    point_feature = point_feature_CN.transpose(0, 1).contiguous()  # (N, C)
-
-    # Merge per-pixel using provided helper
-    out_feature = merge_final(point_feature, vert_weight, vert_index).permute(3, 0, 1, 2)  # (C,T-1,H,W)
-    out_weight  = vert_weight.sum(-1)                                                     # (T-1,H,W)
-
-    # Blend with original features and reattach first frame
-    mix_feature      = out_feature + vid[vae_divide[0]:, 1:] * (1 - out_weight.clamp(0, 1))
-    out_feature_full = torch.cat([vid[vae_divide[0]:, :1], mix_feature], dim=1)          # (C,T,H,W)
-    out_mask_full    = torch.cat([torch.ones_like(out_weight[:1]), out_weight], dim=0)   # (T,H,W)
-
-    # Prepend mask channels for VAE split
+    # Prepend mask channels
     return torch.cat(
         [out_mask_full[None].expand(vae_divide[0], -1, -1, -1), out_feature_full],
         dim=0
