@@ -24,8 +24,9 @@ from .enhance_a_video.globals import set_enhance_weight, set_num_frames
 from .taehv import TAEHV
 from contextlib import nullcontext
 from einops import rearrange
-import custom_nodes.ComfyUI_WanVideoWrapper.ATI.motion_patch as _mp
-src = open(_mp.__file__,'rb').read()
+import custom_nodes.ComfyUI-WanVideoWrapper.ATI.motion_patch as _mp
+with open(_mp.__file__, "rb") as f:
+    src = f.read()
 print("USING ATI:", _mp.__file__, "MD5:", hashlib.md5(src).hexdigest())
 
 from comfy import model_management as mm
