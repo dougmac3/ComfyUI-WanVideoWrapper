@@ -8,6 +8,7 @@ import copy
 from PIL import Image
 import hashlib
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+from .ATI import motion_patch as ati_motion
 
 from .wanvideo.modules.model import rope_params
 from .custom_linear import remove_lora_from_module, set_lora_params
@@ -23,6 +24,9 @@ from .enhance_a_video.globals import set_enhance_weight, set_num_frames
 from .taehv import TAEHV
 from contextlib import nullcontext
 from einops import rearrange
+import custom_nodes.ComfyUI_WanVideoWrapper.ATI.motion_patch as _mp
+src = open(_mp.__file__,'rb').read()
+print("USING ATI:", _mp.__file__, "MD5:", hashlib.md5(src).hexdigest())
 
 from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale, load_torch_file
@@ -1951,8 +1955,10 @@ class WanVideoSampler:
                     temperature = transformer_options.get("ati_temperature", 220.0)
                     ati_start_percent = transformer_options.get("ati_start_percent", 0.0)
                     ati_end_percent = transformer_options.get("ati_end_percent", 1.0)
-                    image_cond_ati = ati_motion.patch_motion(ATI_tracks.to(image_cond.device, image_cond.dtype),
-                                         image_cond, topk=topk, temperature=temperature)
+                    image_cond_ati = ati_motion.patch_motion_tether(
+                        ATI_tracks.to(image_cond.device, image_cond.dtype),
+                        image_cond, topk=topk, temperature=temperature
+                    )
                     log.info(f"ATI tracks shape: {ATI_tracks.shape}")
             
             add_cond_latents = image_embeds.get("add_cond_latents", None)

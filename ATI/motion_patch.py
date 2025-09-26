@@ -4,6 +4,76 @@ import torch
 import torch.nn.functional as F
 
 @torch.inference_mode()
+def patch_motion_tether(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
+    """
+    tracks: (B, T, N, 4)  [mask_or_dummy, x, y, visible]
+    vid:    (C, T, H, W)
+    return: (C + vae_divide[0], T, H, W)
+    """
+    C, T, H, W = vid.shape
+    B, _, N, _ = tracks.shape
+
+    # split xy / visible
+    _, xy, visible = torch.split(tracks, [1,2,1], dim=-1)        # (B,T,N,2), (B,T,N,1)
+    s = float(min(H, W))
+    norm = torch.tensor([W/s, H/s], device=vid.device, dtype=vid.dtype)
+    xy_n = (xy / norm).clamp(-1, 1)
+    visible = visible.clamp(0, 1)
+
+    # grid for weights
+    xx = torch.linspace(-W/s, W/s, W, device=vid.device, dtype=vid.dtype)
+    yy = torch.linspace(-H/s, H/s, H, device=vid.device, dtype=vid.dtype)
+    grid = torch.stack(torch.meshgrid(yy, xx, indexing="ij")[::-1], dim=-1)  # (H,W,2)
+
+    # align to T-1 without any group-of-4 reshape
+    xy_pad = xy[:, 1:]        # (B,T-1,N,2)
+    vis_pad = visible[:, 1:]  # (B,T-1,N,1)
+
+    if B == 1:
+        vis_sum = vis_pad.squeeze(0)                # (T-1,N,1)
+        xy_sum  = (xy_pad.squeeze(0) * vis_sum)     # (T-1,N,2)
+    else:
+        vis_sum = vis_pad.sum(0)                    # (T-1,N,1)
+        xy_sum  = (xy_pad * vis_pad).sum(0)         # (T-1,N,2)
+
+    eps = 1e-5
+    align_vis = vis_sum                              # (T-1,N,1)
+    align_xy  = xy_sum / (align_vis + eps)          # (T-1,N,2)
+
+    diff  = align_xy[:, None, None, :, :] - grid[None, :, :, None, :]  # (T-1,H,W,N,2)
+    dist  = (diff * diff).sum(-1)                                     # (T-1,H,W,N)
+    vmask = align_vis.squeeze(-1)                                     # (T-1,N)
+    weight = torch.exp(-dist * temperature) * vmask[:, None, None, :] # (T-1,H,W,N)
+
+    k = int(min(max(1, topk), weight.shape[-1]))
+    vert_weight, vert_index = torch.topk(weight, k=k, dim=-1)         # (T-1,H,W,k)
+
+    # --- robust point-feature extraction (no .t() / permute(1,0)) ---
+    x0 = vid[vae_divide[0]:].permute(1,0,2,3)[:1]        # (1,C,H,W)
+    g  = xy_n[:, :1].reshape(1, 1, N, 2)                 # (1,1,N,2)
+
+    pt = F.grid_sample(x0, g.type(x0.dtype),
+                       mode="bilinear", padding_mode="zeros",
+                       align_corners=False)              # (1,C,1,N)
+
+    # ensure dense & contiguous; flatten to (N,C) safely
+    if getattr(pt, "is_sparse", False):
+        pt = pt.to_dense()
+    pt = pt.contiguous()                                 # (1,C,1,N)
+    pt = pt.view(pt.shape[0], pt.shape[1], -1)           # (1,C,N)
+    point_feature = pt[0].transpose(0,1).contiguous()    # (N,C)
+
+    out_feature = merge_final(point_feature, vert_weight, vert_index) \
+                  .permute(3,0,1,2)                      # (C,T-1,H,W)
+    out_weight  = vert_weight.sum(-1)                    # (T-1,H,W)
+
+    mix_feature = out_feature + vid[vae_divide[0]:,1:] * (1 - out_weight.clamp(0,1))
+    out_full    = torch.cat([vid[vae_divide[0]:,:1], mix_feature], dim=1)   # (C,T,H,W)
+    mask_full   = torch.cat([torch.ones_like(out_weight[:1]), out_weight], dim=0) # (T,H,W)
+
+    return torch.cat([mask_full[None].expand(vae_divide[0], -1, -1, -1), out_full], dim=0)
+
+@torch.inference_mode()
 def _weighted_gather_fuse(point_feature, vert_weight, vert_index):
     """
     point_feature: (N, C)
