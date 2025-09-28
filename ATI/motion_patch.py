@@ -3,6 +3,35 @@ print(">>> USING motion_patch FROM:", __file__)
 import torch
 import torch.nn.functional as F
 
+def merge_final(point_feature: torch.Tensor,
+                vert_weight: torch.Tensor,
+                vert_index: torch.Tensor) -> torch.Tensor:
+    """
+    point_feature: (N, C)            per-track features
+    vert_weight:   (T-1, H, W, k)    weights for top-k tracks per pixel
+    vert_index:    (T-1, H, W, k)    indices of top-k tracks per pixel
+    returns:       (C, T-1, H, W)
+    """
+    # Sanity/dtype
+    assert point_feature.dim() == 2, f"point_feature shape {tuple(point_feature.shape)} != (N,C)"
+    assert vert_weight.shape == vert_index.shape, "vert_weight / vert_index shapes must match"
+    assert vert_index.dtype in (torch.int32, torch.int64), "vert_index must be int"
+
+    # Normalize weights across k to avoid over/under-scaling
+    w = vert_weight
+    wsum = w.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    w = w / wsum  # (T-1, H, W, k)
+
+    # Gather per-track features for each top-k index -> (T-1, H, W, k, C)
+    # Advanced indexing uses vert_index to select rows from (N, C)
+    feats = point_feature[vert_index]  # (T-1, H, W, k, C)
+
+    # Weighted sum over k -> (T-1, H, W, C)
+    fused = (feats * w[..., None]).sum(dim=-2)
+
+    # Reorder to (C, T-1, H, W)
+    return fused.permute(3, 0, 1, 2).contiguous()
+
 @torch.inference_mode()
 def patch_motion_tether(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
     """
