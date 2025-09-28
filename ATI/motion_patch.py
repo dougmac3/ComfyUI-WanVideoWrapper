@@ -32,8 +32,37 @@ def merge_final(point_feature: torch.Tensor,
     # Reorder to (C, T-1, H, W)
     return fused.permute(3, 0, 1, 2).contiguous()
 
+def _resample_tracks_time(tracks: torch.Tensor, T_target: int) -> torch.Tensor:
+    """
+    tracks: (B, T_src, N, 4) with [mask_or_dummy, x, y, visible]
+    returns: (B, T_target, N, 4) with time-resampled x,y,visible and mask=1
+    """
+    B, T_src, N, D = tracks.shape
+    assert D == 4, f"expected last dim 4, got {D}"
+    device, dtype = tracks.device, tracks.dtype
+
+    # Split off xyv (drop mask/dummy)
+    _, xyv = torch.split(tracks, [1, 3], dim=-1)        # (B, T_src, N, 3)
+
+    # Prepare for 1D linear interpolation over time
+    # (B, T_src, N, 3) -> (B, N, 3, T_src) -> (B*N, 3, T_src)
+    x = xyv.permute(0, 2, 3, 1).reshape(B * N, 3, T_src)
+
+    # Interpolate to target T
+    x = F.interpolate(x, size=T_target, mode="linear", align_corners=False)  # (B*N, 3, T_target)
+
+    # Back to (B, T_target, N, 3)
+    xyv_new = x.reshape(B, N, 3, T_target).permute(0, 3, 1, 2).contiguous()
+
+    # Rebuild mask channel as ones (or keep your own rule if needed)
+    mask = torch.ones((B, T_target, N, 1), device=device, dtype=dtype)
+
+    return torch.cat([mask, xyv_new], dim=-1)           # (B, T_target, N, 4)
+
 @torch.inference_mode()
 def patch_motion_tether(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
+    if tracks.shape[1] != T:
+    tracks = _resample_tracks_time(tracks, T)
     """
     tracks: (B, T, N, 4)  [mask_or_dummy, x, y, visible]
     vid:    (C, T, H, W)
@@ -125,6 +154,8 @@ def _weighted_gather_fuse(point_feature, vert_weight, vert_index):
 
 @torch.inference_mode()
 def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
+    if tracks.shape[1] != T:
+    tracks = _resample_tracks_time(tracks, T)
     """
     tracks: (B, T, N, 4)  last dim = [mask_or_dummy, x, y, visible]
     vid:    (C, T, H, W)
