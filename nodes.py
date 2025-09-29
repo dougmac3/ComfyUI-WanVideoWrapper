@@ -95,6 +95,21 @@ def offload_transformer(transformer):
     mm.soft_empty_cache()
     gc.collect()
 
+def _resample_tracks_time(tracks, target_T):
+    """
+    tracks: (B, T, N, 4)   4 = [mask_or_dummy, x, y, visible]
+    returns: (B, target_T, N, 4)
+    """
+    import torch
+    import torch.nn.functional as F
+    assert tracks.dim() == 4 and tracks.size(-1) == 4, f"expected (B,T,N,4), got {tuple(tracks.shape)}"
+    B, T_in, N, C = tracks.shape
+    # reshape to (B*N, C, T) so 'linear' (1D) is valid
+    x = tracks.permute(0, 2, 3, 1).contiguous().reshape(B * N, C, T_in)    # (B*N, 4, T_in)
+    x = F.interpolate(x, size=target_T, mode="linear", align_corners=False) # (B*N, 4, target_T)
+    out = x.reshape(B, N, C, target_T).permute(0, 3, 1, 2).contiguous()     # (B, target_T, N, 4)
+    return out
+
 class WanVideoEnhanceAVideo:
     @classmethod
     def INPUT_TYPES(s):
@@ -1952,51 +1967,28 @@ class WanVideoSampler:
             if transformer_options is not None:
                 ATI_tracks = transformer_options.get("ati_tracks", None)
                 if ATI_tracks is not None:
-                    # Safe import (handles dash in package name)
-                    try:
-                        from .ATI import motion_patch as _mp
-                    except Exception:
-                        import importlib
-                        _mp = importlib.import_module(
-                            "custom_nodes.ComfyUI-WanVideoWrapper.ATI.motion_patch"
-                        )
-
-                    # Read options
+                    from .ATI import motion_patch as ati_motion
                     topk = transformer_options.get("ati_topk", 2)
                     temperature = transformer_options.get("ati_temperature", 220.0)
                     ati_start_percent = transformer_options.get("ati_start_percent", 0.0)
-                    ati_end_percent   = transformer_options.get("ati_end_percent", 1.0)
+                    ati_end_percent   = transformer_options.get("ati_end_percent",   1.0)
 
+                    # image_cond is (C_all, T, H, W); use its T as the canonical video length
+                    T_video = int(image_cond.shape[1])
 
-                    ATI_tracks = ATI_tracks.to(image_cond.device, image_cond.dtype)
+                    # AE sometimes sends T != T_video; resample tracks along time only
+                    if ATI_tracks.shape[1] != T_video:
+                        ATI_tracks = _resample_tracks_time(ATI_tracks, T_video)
 
-                    T_vid = int(image_cond.shape[1])          # video frames (the sampler uses C x T x H x W)
-                    T_trk = int(ATI_tracks.shape[1])          # track frames
-
-                    if T_trk != T_vid:
-                        # Tracks shape is (B, T, N, 4). Resample along T -> T_vid.
-                        # We'll do a simple linear interp over time for all 4 channels;
-                        # if you want mask/visible to be nearest, you can split and interp separately.
-                        B, _, N, C4 = ATI_tracks.shape
-                        ATI_tracks = F.interpolate(
-                            ATI_tracks.permute(0, 2, 3, 1),  # (B, N, 4, T)
-                            size=T_vid,
-                            mode="linear",
-                            align_corners=False
-                        ).permute(0, 3, 1, 2)               # (B, T_vid, N, 4)
-
-                    # Now call the original patch_motion (works for 81 and non-81 as long as T is aligned)
+                    # now apply motion patch (uses first 16 mask channels convention internally)
                     image_cond_ati = ati_motion.patch_motion(
-                        ATI_tracks,
+                        ATI_tracks.to(image_cond.device, image_cond.dtype),
                         image_cond,
                         topk=topk,
                         temperature=temperature
                     )
-
-                    log.info(
-                        f"ATI tracks aligned: tracks_T={ATI_tracks.shape[1]} video_T={image_cond.shape[1]} "
-                        f"(topk={topk}, temp={temperature}, range={ati_start_percent}-{ati_end_percent})"
-                    )
+                    # replace image_cond with ATI-augmented conditioning
+                    image_cond = image_cond_ati
 
         else: #t2v
             target_shape = image_embeds.get("target_shape", None)
