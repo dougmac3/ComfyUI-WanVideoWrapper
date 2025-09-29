@@ -1,5 +1,6 @@
 import os, gc, math
-import torch
+import torch as _torch
+torch = _torch
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
