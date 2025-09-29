@@ -2116,7 +2116,7 @@ class WanVideoSampler:
             phantom_start_percent = image_embeds.get("phantom_start_percent", 0.0)
             phantom_end_percent = image_embeds.get("phantom_end_percent", 1.0)
 
-        latent_video_length = noise.shape[1]
+        latent_video_length = image_cond.shape[1]
 
         # Initialize FreeInit filter if enabled
         freq_filter = None
