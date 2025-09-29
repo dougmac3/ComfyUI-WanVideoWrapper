@@ -80,69 +80,120 @@ def _weighted_gather_fuse(point_feature, vert_weight, vert_index):
     return fused.permute(3, 0, 1, 2).contiguous()
 
 @torch.inference_mode()
-def patch_motion(
-    tracks: torch.FloatTensor,  # (B, T, N, 4) -> [mask/dummy, x, y, visible]
-    vid: torch.FloatTensor,     # (C, T, H, W)
-    temperature: float = 220.0,
-    vae_divide: tuple = (4, 16),
-    topk: int = 2,
-):
+def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
+    """
+    tracks: (B, T, N, 4)  last dim = [mask_or_dummy, x, y, visible]
+    vid:    (C, T, H, W)
+    return: (C + vae_divide[0], T, H, W)
+    """
+    import torch
+    import torch.nn.functional as F
+
+    # --- local helper: resample tracks along time to match video T ---
+    def _resample_tracks_time(tracks_in, target_T):
+        # tracks_in: (B, T, N, 4)
+        if not isinstance(tracks_in, torch.Tensor):
+            tracks_in = torch.tensor(tracks_in)
+        assert tracks_in.dim() == 4 and tracks_in.size(-1) == 4, f"expected (B,T,N,4), got {tuple(tracks_in.shape)}"
+
+        B, T_in, N, C = tracks_in.shape  # C==4
+        x = tracks_in.permute(0, 2, 3, 1).contiguous().reshape(B * N, C, T_in).to(torch.float32)  # (B*N,4,T)
+        x = F.interpolate(x, size=target_T, mode="linear", align_corners=False)                    # (B*N,4,target_T)
+        out = x.reshape(B, N, C, target_T).permute(0, 3, 1, 2).contiguous()                        # (B,target_T,N,4)
+        return out.to(tracks_in.dtype)
+
+    @torch.no_grad()
+    def _to_strided(x):
+        if hasattr(x, "layout") and x.layout != torch.strided:
+            x = x.to_dense()
+        return x.contiguous()
+
     with torch.no_grad():
+        # Sanitize and align time lengths first
+        vid    = _to_strided(vid)
+        tracks = _to_strided(tracks)
+
         C, T, H, W = vid.shape
+        if tracks.shape[1] != T:
+            tracks = _resample_tracks_time(tracks, T)
+
         B, _, N, _ = tracks.shape
 
-        # Guard: Wan latent time expects (T-1) divisible by 4 (e.g., 81 -> 21 -> 20)
-        if (T - 1) % 4 != 0:
-            raise ValueError(f"(T-1) must be divisible by 4; got T={T} from vid.shape. Check num_frames (should be 4k+1).")
-
-        # Split xy + visibility and normalize xy into [-1,1] in pixel space
-        _, xy, visible = torch.split(tracks, [1, 2, 1], dim=-1)   # (B,T,N,2), (B,T,N,1)
+        # Split xy + visibility
+        _, xy, visible = torch.split(tracks, [1, 2, 1], dim=-1)   # xy:(B,T,N,2)  visible:(B,T,N,1)
         s = float(min(H, W))
         norm = torch.tensor([W / s, H / s], device=vid.device, dtype=vid.dtype)
-        xy_n = (xy / norm).clamp(-1, 1)                           # (B,T,N,2)
-        visible = visible.clamp(0, 1)                             # (B,T,N,1)
+        xy_n = (xy / norm).clamp(-1, 1)
+        visible = visible.clamp(0, 1)
 
-        # Static grid in pixel coords
+        # Grid over image for distance weighting
         xx = torch.linspace(-W / s, W / s, W, device=vid.device, dtype=vid.dtype)
         yy = torch.linspace(-H / s, H / s, H, device=vid.device, dtype=vid.dtype)
         grid = torch.stack(torch.meshgrid(yy, xx, indexing="ij")[::-1], dim=-1)  # (H,W,2)
+        grid = _to_strided(grid)
 
-        # Align to T-1 (next frame), then reduce over batch first (robust for any B)
+        # Align to T-1
         xy_pad = xy[:, 1:]        # (B,T-1,N,2)
         vis_pad = visible[:, 1:]  # (B,T-1,N,1)
 
-        # Safe batch reduction (keeps original math when B==1)
-        vis_sum = vis_pad.sum(0)              # (T-1,N,1)
-        xy_sum  = (xy_pad * vis_pad).sum(0)   # (T-1,N,2)
+        # Accumulate across batch
+        if B == 1:
+            vis_sum = _to_strided(vis_pad.squeeze(0))            # (T-1,N,1)
+            xy_sum  = _to_strided(xy_pad.squeeze(0) * vis_sum)   # (T-1,N,2)
+        else:
+            vis_sum = _to_strided(vis_pad.sum(0))                # (T-1,N,1)
+            xy_sum  = _to_strided((xy_pad * vis_pad).sum(0))     # (T-1,N,2)
 
-        # Now reshape time into (groups of 4) without touching batch
-        t_groups = (T - 1) // 4
-        vis_blocks = vis_sum.reshape(t_groups, 4, N, 1).sum(1)           # (t_groups, N, 1)
-        xy_blocks  = xy_sum.reshape(t_groups, 4, N, 2).sum(1)            # (t_groups, N, 2)
         eps = 1e-5
-        align_vis = vis_blocks                                           # (t_groups,N,1)
-        align_xy  = xy_blocks / (align_vis + eps)                        # (t_groups,N,2)
+        align_vis = vis_sum                                      # (T-1,N,1)
+        align_xy  = _to_strided(xy_sum / (align_vis + eps))      # (T-1,N,2)
 
-        # Distance→weights (t_groups,H,W,N)
-        diff  = align_xy[:, None, None, :, :] - grid[None, :, :, None, :]    # (t_groups,H,W,N,2)
-        dist  = (diff * diff).sum(-1)                                        # (t_groups,H,W,N)
-        weight = torch.exp(-dist * temperature) * align_vis.squeeze(-1)[:, None, None, :]  # (t_groups,H,W,N)
+        # Distance -> weights (T-1,H,W,N)
+        diff   = _to_strided(align_xy[:, None, None, :, :] - grid[None, :, :, None, :])
+        dist   = _to_strided((diff * diff).sum(-1))
+        vmask  = _to_strided(align_vis.squeeze(-1))              # (T-1,N)
+        weight = _to_strided(torch.exp(-dist * temperature) * vmask[:, None, None, :])
 
+        # Top-k over tracks
         k = int(min(max(1, topk), weight.shape[-1]))
-        vert_weight, vert_index = torch.topk(weight, k=k, dim=-1)            # (t_groups,H,W,k)
+        vert_weight, vert_index = torch.topk(weight, k=k, dim=-1)    # (T-1,H,W,k)
+        vert_weight = _to_strided(vert_weight)
+        vert_index  = _to_strided(vert_index)
 
-    # Sample point features from frame 0 latent (C=vae_divide[1]) at normalized coords of t=0
-    x0_in = vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1]           # (1,C,H,W)
-    g     = xy_n[:, :1].reshape(1, 1, N, 2).to(x0_in.dtype)       # (1,1,N,2)
-    pt = F.grid_sample(x0_in, g, mode="bilinear", padding_mode="zeros", align_corners=False)  # (1,C,1,N)
-    pt = pt.contiguous()
-    point_feature = pt[0, :, 0, :].transpose(0, 1).contiguous()   # (N,C)
+    # === point-feature extraction on first frame ===
+    x0_in = _to_strided(vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1])      # (1,C,H,W)
+    grid_ = _to_strided(xy_n[:, :1].reshape(1, 1, N, 2).to(x0_in.dtype))  # (1,1,N,2)
 
-    # Merge & blend (keep original outputs for 81 frames)
-    out_feature = merge_final(point_feature, vert_weight, vert_index).permute(3, 0, 1, 2)  # (C,T-1,H,W)
-    out_weight  = vert_weight.sum(-1)                                                      # (T-1,H,W)
-    mix_feature = out_feature + vid[vae_divide[0]:, 1:] * (1 - out_weight.clamp(0, 1))
-    out_feature_full = torch.cat([vid[vae_divide[0]:, :1], mix_feature], dim=1)            # (C,T,H,W)
-    out_mask_full    = torch.cat([torch.ones_like(out_weight[:1]), out_weight], dim=0)     # (T,H,W)
+    try:
+        pt = F.grid_sample(
+            x0_in, grid_,
+            mode="bilinear", padding_mode="zeros", align_corners=False
+        )  # -> (1, C, 1, N)
+        pt = _to_strided(pt)
+        point_feature = _to_strided(pt[0, :, 0, :]).transpose(0, 1)  # (N, C)
+    except Exception:
+        # fallback: nearest-neighbor gather
+        x0 = _to_strided(vid[vae_divide[0]:, 0])   # (C,H,W)
+        xy0 = _to_strided(xy_n[:, 0, :, :])
+        if xy0.dim() == 3 and xy0.shape[0] == 1:
+            xy0 = xy0[0]                           # (N,2)
+        px = ((xy0[..., 0] + 1) * 0.5) * (W - 1)
+        py = ((xy0[..., 1] + 1) * 0.5) * (H - 1)
+        px = torch.clamp(px.round().long(), 0, W - 1)
+        py = torch.clamp(py.round().long(), 0, H - 1)
+        point_feature = _to_strided(x0[:, py, px].transpose(0, 1))  # (N, C)
 
-    return torch.cat([out_mask_full[None].expand(vae_divide[0], -1, -1, -1), out_feature_full], dim=0)
+    # Merge per-pixel (merge_final is expected to be defined in this module)
+    out_feature = _to_strided(merge_final(point_feature, vert_weight, vert_index).permute(3, 0, 1, 2))  # (C,T-1,H,W)
+    out_weight  = _to_strided(vert_weight.sum(-1))                                                      # (T-1,H,W)
+
+    # Blend & reattach first frame — time dims now agree: both T-1
+    mix_feature      = _to_strided(out_feature + vid[vae_divide[0]:, 1:] * (1 - out_weight.clamp(0, 1)))
+    out_feature_full = _to_strided(torch.cat([vid[vae_divide[0]:, :1], mix_feature], dim=1))  # (C,T,H,W)
+    out_mask_full    = _to_strided(torch.cat([torch.ones_like(out_weight[:1]), out_weight], dim=0))  # (T,H,W)
+
+    # Prepend mask channels for VAE split
+    return torch.cat(
+        [out_mask_full[None].expand(vae_divide[0], -1, -1, -1), out_feature_full],
+        dim=0
+    )
