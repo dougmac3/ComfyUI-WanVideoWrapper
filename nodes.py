@@ -1947,98 +1947,98 @@ class WanVideoSampler:
             log.info(f"image_cond shape: {image_cond.shape}")
 
             #ATI tracks
-        if transformer_options is not None:
-            ATI_tracks = transformer_options.get("ati_tracks", None)
-            if ATI_tracks is not None:
-                from .ATI import motion_patch as ati_motion
+            if transformer_options is not None:
+                ATI_tracks = transformer_options.get("ati_tracks", None)
+                if ATI_tracks is not None:
+                    from .ATI import motion_patch as ati_motion
 
-                    # Read options (kept for compatibility/logging)
-                    topk = transformer_options.get("ati_topk", 2)
-                    temperature = transformer_options.get("ati_temperature", 220.0)
-                    ati_start_percent = transformer_options.get("ati_start_percent", 0.0)
-                    ati_end_percent = transformer_options.get("ati_end_percent", 1.0)
+                        # Read options (kept for compatibility/logging)
+                        topk = transformer_options.get("ati_topk", 2)
+                        temperature = transformer_options.get("ati_temperature", 220.0)
+                        ati_start_percent = transformer_options.get("ati_start_percent", 0.0)
+                        ati_end_percent = transformer_options.get("ati_end_percent", 1.0)
 
-                    # ---- Normalize tracks & validate time ----
-                    ATI_tracks = ATI_tracks.to(image_cond.device, image_cond.dtype)
+                        # ---- Normalize tracks & validate time ----
+                        ATI_tracks = ATI_tracks.to(image_cond.device, image_cond.dtype)
 
-                    # Ensure batch dim present: (B,T,N,4)
-                    if ATI_tracks.dim() == 3:
-                        ATI_tracks = ATI_tracks.unsqueeze(0)  # -> (1,T,N,4)
+                        # Ensure batch dim present: (B,T,N,4)
+                        if ATI_tracks.dim() == 3:
+                            ATI_tracks = ATI_tracks.unsqueeze(0)  # -> (1,T,N,4)
 
-                    ATI_tracks = ATI_tracks.contiguous()
-                    B, T_tracks, N, C4 = ATI_tracks.shape
+                        ATI_tracks = ATI_tracks.contiguous()
+                        B, T_tracks, N, C4 = ATI_tracks.shape
 
-                    # Video latent time from image_cond (C_total, T, H, W)
-                    _, T_vid, _, _ = image_cond.shape
+                        # Video latent time from image_cond (C_total, T, H, W)
+                        _, T_vid, _, _ = image_cond.shape
 
-                    # Enforce the contract: tracks time must match latent time
-                    if T_tracks != T_vid:
-                        raise ValueError(
-                            f"ATI tracks T ({T_tracks}) must equal video T ({T_vid}). "
-                            f"If you’re feeding 81 pixel frames, latent T should be 21 ((81-1)//4 + 1)."
+                        # Enforce the contract: tracks time must match latent time
+                        if T_tracks != T_vid:
+                            raise ValueError(
+                                f"ATI tracks T ({T_tracks}) must equal video T ({T_vid}). "
+                                f"If you’re feeding 81 pixel frames, latent T should be 21 ((81-1)//4 + 1)."
+                            )
+
+                        # ---- Apply ATI motion patch (robust version) ----
+                        # NOTE: we call patch_motion (not *_tether) to keep original behavior,
+                        # and pass the same defaults the wrapper expects.
+                        image_cond_ati = ati_motion.patch_motion(
+                            ATI_tracks,
+                            image_cond,
+                            topk=topk,
+                            temperature=temperature,
+                            vae_divide=(4, 16),
                         )
 
-                    # ---- Apply ATI motion patch (robust version) ----
-                    # NOTE: we call patch_motion (not *_tether) to keep original behavior,
-                    # and pass the same defaults the wrapper expects.
-                    image_cond_ati = ati_motion.patch_motion(
-                        ATI_tracks,
-                        image_cond,
-                        topk=topk,
-                        temperature=temperature,
-                        vae_divide=(4, 16),
-                    )
-
-                    log.info(
-                        f"ATI tracks shape: {ATI_tracks.shape} | topk={topk} temp={temperature} "
-                        f"range=({ati_start_percent},{ati_end_percent})"
-                    )
-                    
-                    add_cond_latents = image_embeds.get("add_cond_latents", None)
-                    if add_cond_latents is not None:
-                        add_cond = add_cond_latents["pose_latent"]
-                        attn_cond = add_cond_latents["ref_latent"]
-                        attn_cond_neg = add_cond_latents["ref_latent_neg"]
-                        add_cond_start_percent = add_cond_latents["pose_cond_start_percent"]
-                        add_cond_end_percent = add_cond_latents["pose_cond_end_percent"]
-
-                    end_image = image_embeds.get("end_image", None)
-                    fun_or_fl2v_model = image_embeds.get("fun_or_fl2v_model", False)
-
-                    noise = torch.randn( #C, T, H, W
-                        48 if is_5b else 16,
-                        (image_embeds["num_frames"] - 1) // 4 + (2 if end_image is not None and not fun_or_fl2v_model else 1),
-                        image_embeds["lat_h"],
-                        image_embeds["lat_w"],
-                        dtype=torch.float32,
-                        generator=seed_g,
-                        device=torch.device("cpu"))
-                    seq_len = image_embeds["max_seq_len"]
-
-                    clip_fea = image_embeds.get("clip_context", None)
-                    if clip_fea is not None:
-                        clip_fea = clip_fea.to(dtype)
-                    clip_fea_neg = image_embeds.get("negative_clip_context", None)
-                    if clip_fea_neg is not None:
-                        clip_fea_neg = clip_fea_neg.to(dtype)
-
-                    control_embeds = image_embeds.get("control_embeds", None)
-                    if control_embeds is not None:
-                        if transformer.in_dim not in [148, 52, 48, 36, 32]:
-                            raise ValueError("Control signal only works with Fun-Control model")
-
-                        control_latents = control_embeds.get("control_images", None)
-                        control_start_percent = control_embeds.get("start_percent", 0.0)
-                        control_end_percent = control_embeds.get("end_percent", 1.0)
-                        control_camera_latents = control_embeds.get("control_camera_latents", None)
-                        if control_camera_latents is not None:
-                            if transformer.control_adapter is None:
-                                raise ValueError("Control camera latents are only supported with Fun-Control-Camera model")
-                            control_camera_start_percent = control_embeds.get("control_camera_start_percent", 0.0)
-                            control_camera_end_percent = control_embeds.get("control_camera_end_percent", 1.0)
+                        log.info(
+                            f"ATI tracks shape: {ATI_tracks.shape} | topk={topk} temp={temperature} "
+                            f"range=({ati_start_percent},{ati_end_percent})"
+                        )
                         
-                    drop_last = image_embeds.get("drop_last", False)
-                    has_ref = image_embeds.get("has_ref", False)
+                        add_cond_latents = image_embeds.get("add_cond_latents", None)
+                        if add_cond_latents is not None:
+                            add_cond = add_cond_latents["pose_latent"]
+                            attn_cond = add_cond_latents["ref_latent"]
+                            attn_cond_neg = add_cond_latents["ref_latent_neg"]
+                            add_cond_start_percent = add_cond_latents["pose_cond_start_percent"]
+                            add_cond_end_percent = add_cond_latents["pose_cond_end_percent"]
+
+                        end_image = image_embeds.get("end_image", None)
+                        fun_or_fl2v_model = image_embeds.get("fun_or_fl2v_model", False)
+
+                        noise = torch.randn( #C, T, H, W
+                            48 if is_5b else 16,
+                            (image_embeds["num_frames"] - 1) // 4 + (2 if end_image is not None and not fun_or_fl2v_model else 1),
+                            image_embeds["lat_h"],
+                            image_embeds["lat_w"],
+                            dtype=torch.float32,
+                            generator=seed_g,
+                            device=torch.device("cpu"))
+                        seq_len = image_embeds["max_seq_len"]
+
+                        clip_fea = image_embeds.get("clip_context", None)
+                        if clip_fea is not None:
+                            clip_fea = clip_fea.to(dtype)
+                        clip_fea_neg = image_embeds.get("negative_clip_context", None)
+                        if clip_fea_neg is not None:
+                            clip_fea_neg = clip_fea_neg.to(dtype)
+
+                        control_embeds = image_embeds.get("control_embeds", None)
+                        if control_embeds is not None:
+                            if transformer.in_dim not in [148, 52, 48, 36, 32]:
+                                raise ValueError("Control signal only works with Fun-Control model")
+
+                            control_latents = control_embeds.get("control_images", None)
+                            control_start_percent = control_embeds.get("start_percent", 0.0)
+                            control_end_percent = control_embeds.get("end_percent", 1.0)
+                            control_camera_latents = control_embeds.get("control_camera_latents", None)
+                            if control_camera_latents is not None:
+                                if transformer.control_adapter is None:
+                                    raise ValueError("Control camera latents are only supported with Fun-Control-Camera model")
+                                control_camera_start_percent = control_embeds.get("control_camera_start_percent", 0.0)
+                                control_camera_end_percent = control_embeds.get("control_camera_end_percent", 1.0)
+                            
+                        drop_last = image_embeds.get("drop_last", False)
+                        has_ref = image_embeds.get("has_ref", False)
         else: #t2v
             target_shape = image_embeds.get("target_shape", None)
             if target_shape is None:
