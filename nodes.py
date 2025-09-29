@@ -49,10 +49,10 @@ except:
 
 # add this with the other imports in ComfyUI-WanVideoWrapper/nodes.py
 try:
-    from .ATI import motion_patch as ati_motion
+    from .ATI import motion_patch as _mp
 except Exception:
     import importlib
-    ati_motion = importlib.import_module(
+    _mp = importlib.import_module(
         "custom_nodes.ComfyUI-WanVideoWrapper.ATI.motion_patch"
     )
 
@@ -1953,10 +1953,10 @@ class WanVideoSampler:
                 if ATI_tracks is not None:
                     # Safe import (handles dash in package name)
                     try:
-                        from .ATI import motion_patch as ati_motion
+                        from .ATI import motion_patch as _mp
                     except Exception:
                         import importlib
-                        ati_motion = importlib.import_module(
+                        _mp = importlib.import_module(
                             "custom_nodes.ComfyUI-WanVideoWrapper.ATI.motion_patch"
                         )
 
