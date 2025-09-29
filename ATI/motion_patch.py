@@ -3,34 +3,32 @@ print(">>> USING motion_patch FROM:", __file__)
 import torch
 import torch.nn.functional as F
 
-def merge_final(point_feature: torch.Tensor,
-                vert_weight: torch.Tensor,
-                vert_index: torch.Tensor) -> torch.Tensor:
-    """
-    point_feature: (N, C)            per-track features
-    vert_weight:   (T-1, H, W, k)    weights for top-k tracks per pixel
-    vert_index:    (T-1, H, W, k)    indices of top-k tracks per pixel
-    returns:       (C, T-1, H, W)
-    """
-    # Sanity/dtype
-    assert point_feature.dim() == 2, f"point_feature shape {tuple(point_feature.shape)} != (N,C)"
-    assert vert_weight.shape == vert_index.shape, "vert_weight / vert_index shapes must match"
-    assert vert_index.dtype in (torch.int32, torch.int64), "vert_index must be int"
+def ind_sel(target: torch.Tensor, ind: torch.Tensor, dim: int = 1):
+    assert (len(ind.shape) > dim), "Index must have the target dim"
+    target = target.expand(
+        *tuple(
+            [ind.shape[k] if target.shape[k] == 1 else -1 for k in range(dim)]
+            + [-1] * (len(target.shape) - dim)
+        )
+    )
+    ind_pad = ind
+    if len(target.shape) > dim + 1:
+        for _ in range(len(target.shape) - (dim + 1)):
+            ind_pad = ind_pad.unsqueeze(-1)
+        ind_pad = ind_pad.expand(*(-1,) * (dim + 1), *target.shape[(dim + 1):])
+    return torch.gather(target, dim=dim, index=ind_pad)
 
-    # Normalize weights across k to avoid over/under-scaling
-    w = vert_weight
-    wsum = w.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-    w = w / wsum  # (T-1, H, W, k)
-
-    # Gather per-track features for each top-k index -> (T-1, H, W, k, C)
-    # Advanced indexing uses vert_index to select rows from (N, C)
-    feats = point_feature[vert_index]  # (T-1, H, W, k, C)
-
-    # Weighted sum over k -> (T-1, H, W, C)
-    fused = (feats * w[..., None]).sum(dim=-2)
-
-    # Reorder to (C, T-1, H, W)
-    return fused.permute(3, 0, 1, 2).contiguous()
+def merge_final(vert_attr: torch.Tensor, weight: torch.Tensor, vert_assign: torch.Tensor):
+    target_dim = len(vert_assign.shape) - 1
+    if len(vert_attr.shape) == 2:
+        new_shape = [1] * target_dim + list(vert_attr.shape)
+        tensor = vert_attr.reshape(new_shape)
+        sel_attr = ind_sel(tensor, vert_assign.long(), dim=target_dim)
+    else:
+        new_shape = [vert_attr.shape[0]] + [1] * (target_dim - 1) + list(vert_attr.shape[1:])
+        tensor = vert_attr.reshape(new_shape)
+        sel_attr = ind_sel(tensor, vert_assign.long(), dim=target_dim)
+    return torch.sum(sel_attr * weight.unsqueeze(-1), dim=-2)
 
 def _resample_tracks_time(tracks: torch.Tensor, T_target: int) -> torch.Tensor:
     """
@@ -59,101 +57,6 @@ def _resample_tracks_time(tracks: torch.Tensor, T_target: int) -> torch.Tensor:
 
     return torch.cat([mask, xyv_new], dim=-1)           # (B, T_target, N, 4)
 
-@torch.inference_mode()
-def patch_motion_tether(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
-    """
-    tracks: (B, T, N, 4)  [mask_or_dummy, x, y, visible]
-    vid:    (C, T, H, W)
-    return: (C + vae_divide[0], T, H, W)
-    """
-    import torch
-    import torch.nn.functional as F
-
-    def _to_strided(x):
-        if hasattr(x, "layout") and x.layout != torch.strided:
-            x = x.to_dense()
-        return x.contiguous()
-
-    def _resample_tracks_time(tr, T_out: int):
-        B, T_in, N, D = tr.shape
-        if T_in == T_out:
-            return tr
-        x = tr.permute(0, 2, 3, 1).reshape(B * N * D, 1, T_in).to(tr.dtype)
-        x = torch.nn.functional.interpolate(x, size=T_out, mode="linear", align_corners=False)
-        x = x.reshape(B, N, D, T_out).permute(0, 3, 1, 2).contiguous()
-        return x
-
-    vid    = _to_strided(vid)
-    tracks = _to_strided(tracks)
-
-    C, T, H, W = vid.shape
-    if tracks.shape[1] != T:
-        tracks = _resample_tracks_time(tracks, T)
-
-    B, _, N, _ = tracks.shape
-
-    # split xy / visible
-    _, xy, visible = torch.split(tracks, [1, 2, 1], dim=-1)        # (B,T,N,2), (B,T,N,1)
-    s = float(min(H, W))
-    norm = torch.tensor([W / s, H / s], device=vid.device, dtype=vid.dtype)
-    xy_n = (xy / norm).clamp(-1, 1)
-    visible = visible.clamp(0, 1)
-
-    # grid for weights
-    xx = torch.linspace(-W / s, W / s, W, device=vid.device, dtype=vid.dtype)
-    yy = torch.linspace(-H / s, H / s, H, device=vid.device, dtype=vid.dtype)
-    grid = torch.stack(torch.meshgrid(yy, xx, indexing="ij")[::-1], dim=-1)  # (H,W,2)
-    grid = _to_strided(grid)
-
-    # align to T-1
-    xy_pad  = xy[:, 1:]        # (B,T-1,N,2)
-    vis_pad = visible[:, 1:]   # (B,T-1,N,1)
-
-    if B == 1:
-        vis_sum = _to_strided(vis_pad.squeeze(0))           # (T-1,N,1)
-        xy_sum  = _to_strided(xy_pad.squeeze(0) * vis_sum)  # (T-1,N,2)
-    else:
-        vis_sum = _to_strided(vis_pad.sum(0))               # (T-1,N,1)
-        xy_sum  = _to_strided((xy_pad * vis_pad).sum(0))    # (T-1,N,2)
-
-    eps = 1e-5
-    align_vis = vis_sum                                     # (T-1,N,1)
-    align_xy  = _to_strided(xy_sum / (align_vis + eps))     # (T-1,N,2)
-
-    diff  = _to_strided(align_xy[:, None, None, :, :] - grid[None, :, :, None, :])  # (T-1,H,W,N,2)
-    dist  = _to_strided((diff * diff).sum(-1))                                      # (T-1,H,W,N)
-    vmask = _to_strided(align_vis.squeeze(-1))                                       # (T-1,N)
-    weight = _to_strided(torch.exp(-dist * temperature) * vmask[:, None, None, :])  # (T-1,H,W,N)
-
-    k = int(min(max(1, topk), weight.shape[-1]))
-    vert_weight, vert_index = torch.topk(weight, k=k, dim=-1)                       # (T-1,H,W,k)
-    vert_weight = _to_strided(vert_weight)
-    vert_index  = _to_strided(vert_index)
-
-    # robust point-feature extraction (no .t() / permute(1,0))
-    x0 = _to_strided(vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1])   # (1,C,H,W)
-    g  = _to_strided(xy_n[:, :1].reshape(1, 1, N, 2).to(x0.dtype))  # (1,1,N,2)
-
-    pt = F.grid_sample(
-        x0, g,
-        mode="bilinear", padding_mode="zeros", align_corners=False
-    )  # (1,C,1,N)
-
-    if getattr(pt, "is_sparse", False):
-        pt = pt.to_dense()
-    pt = pt.contiguous()
-    pt = pt.view(pt.shape[0], pt.shape[1], -1)              # (1,C,N)
-    point_feature = pt[0].transpose(0, 1).contiguous()      # (N,C)
-
-    out_feature = _to_strided(merge_final(point_feature, vert_weight, vert_index).permute(3, 0, 1, 2))  # (C,T-1,H,W)
-    out_weight  = _to_strided(vert_weight.sum(-1))                                                          # (T-1,H,W)
-
-    mix_feature = _to_strided(out_feature + vid[vae_divide[0]:, 1:] * (1 - out_weight.clamp(0, 1)))
-    out_full    = _to_strided(torch.cat([vid[vae_divide[0]:, :1], mix_feature], dim=1))                    # (C,T,H,W)
-    mask_full   = _to_strided(torch.cat([torch.ones_like(out_weight[:1]), out_weight], dim=0))             # (T,H,W)
-
-    return torch.cat([mask_full[None].expand(vae_divide[0], -1, -1, -1), out_full], dim=0)
-
 
 @torch.inference_mode()
 def _weighted_gather_fuse(point_feature, vert_weight, vert_index):
@@ -177,117 +80,69 @@ def _weighted_gather_fuse(point_feature, vert_weight, vert_index):
     return fused.permute(3, 0, 1, 2).contiguous()
 
 @torch.inference_mode()
-def patch_motion(tracks, vid, topk=2, temperature=25.0, vae_divide=(16,)):
-    """
-    tracks: (B, T, N, 4)  last dim = [mask_or_dummy, x, y, visible]
-    vid:    (C, T, H, W)
-    return: (C + vae_divide[0], T, H, W)
-    """
-    import torch
-    import torch.nn.functional as F
-
-    def _to_strided(x):
-        if hasattr(x, "layout") and x.layout != torch.strided:
-            x = x.to_dense()
-        return x.contiguous()
-
-    def _resample_tracks_time(tr, T_out: int):
-        # Linear time resample on the T dimension (keeps B,N,4 intact)
-        B, T_in, N, D = tr.shape
-        if T_in == T_out:
-            return tr
-        # (B, T, N, D) -> (B*N*D, 1, T)
-        x = tr.permute(0, 2, 3, 1).reshape(B * N * D, 1, T_in).to(tr.dtype)
-        x = torch.nn.functional.interpolate(x, size=T_out, mode="linear", align_corners=False)
-        x = x.reshape(B, N, D, T_out).permute(0, 3, 1, 2).contiguous()
-        return x
-
+def patch_motion(
+    tracks: torch.FloatTensor,  # (B, T, N, 4) -> [mask/dummy, x, y, visible]
+    vid: torch.FloatTensor,     # (C, T, H, W)
+    temperature: float = 220.0,
+    vae_divide: tuple = (4, 16),
+    topk: int = 2,
+):
     with torch.no_grad():
-        vid    = _to_strided(vid)
-        tracks = _to_strided(tracks)
-
         C, T, H, W = vid.shape
-        if tracks.shape[1] != T:
-            tracks = _resample_tracks_time(tracks, T)
-
         B, _, N, _ = tracks.shape
 
-        # Split xy + visibility
-        _, xy, visible = torch.split(tracks, [1, 2, 1], dim=-1)    # xy:(B,T,N,2), visible:(B,T,N,1)
+        # Guard: Wan latent time expects (T-1) divisible by 4 (e.g., 81 -> 21 -> 20)
+        if (T - 1) % 4 != 0:
+            raise ValueError(f"(T-1) must be divisible by 4; got T={T} from vid.shape. Check num_frames (should be 4k+1).")
+
+        # Split xy + visibility and normalize xy into [-1,1] in pixel space
+        _, xy, visible = torch.split(tracks, [1, 2, 1], dim=-1)   # (B,T,N,2), (B,T,N,1)
         s = float(min(H, W))
         norm = torch.tensor([W / s, H / s], device=vid.device, dtype=vid.dtype)
-        xy_n = (xy / norm).clamp(-1, 1)
-        visible = visible.clamp(0, 1)
+        xy_n = (xy / norm).clamp(-1, 1)                           # (B,T,N,2)
+        visible = visible.clamp(0, 1)                             # (B,T,N,1)
 
-        # Build normalized grid (H,W,2) used for spatial weights
+        # Static grid in pixel coords
         xx = torch.linspace(-W / s, W / s, W, device=vid.device, dtype=vid.dtype)
         yy = torch.linspace(-H / s, H / s, H, device=vid.device, dtype=vid.dtype)
         grid = torch.stack(torch.meshgrid(yy, xx, indexing="ij")[::-1], dim=-1)  # (H,W,2)
-        grid = _to_strided(grid)
 
-        # Align to T-1
-        xy_pad  = xy[:, 1:]        # (B,T-1,N,2)
-        vis_pad = visible[:, 1:]   # (B,T-1,N,1)
+        # Align to T-1 (next frame), then reduce over batch first (robust for any B)
+        xy_pad = xy[:, 1:]        # (B,T-1,N,2)
+        vis_pad = visible[:, 1:]  # (B,T-1,N,1)
 
-        # Visibility / weighted xy across batch
-        if B == 1:
-            vis_sum = _to_strided(vis_pad.squeeze(0))            # (T-1,N,1)
-            xy_sum  = _to_strided((xy_pad.squeeze(0) * vis_sum)) # (T-1,N,2)
-        else:
-            vis_sum = _to_strided(vis_pad.sum(0))                # (T-1,N,1)
-            xy_sum  = _to_strided((xy_pad * vis_pad).sum(0))     # (T-1,N,2)
+        # Safe batch reduction (keeps original math when B==1)
+        vis_sum = vis_pad.sum(0)              # (T-1,N,1)
+        xy_sum  = (xy_pad * vis_pad).sum(0)   # (T-1,N,2)
 
+        # Now reshape time into (groups of 4) without touching batch
+        t_groups = (T - 1) // 4
+        vis_blocks = vis_sum.reshape(t_groups, 4, N, 1).sum(1)           # (t_groups, N, 1)
+        xy_blocks  = xy_sum.reshape(t_groups, 4, N, 2).sum(1)            # (t_groups, N, 2)
         eps = 1e-5
-        align_vis = vis_sum                                      # (T-1,N,1)
-        align_xy  = _to_strided(xy_sum / (align_vis + eps))      # (T-1,N,2)
+        align_vis = vis_blocks                                           # (t_groups,N,1)
+        align_xy  = xy_blocks / (align_vis + eps)                        # (t_groups,N,2)
 
-        # Distance -> weights (T-1,H,W,N)
-        diff  = _to_strided(align_xy[:, None, None, :, :] - grid[None, :, :, None, :])
-        dist  = _to_strided((diff * diff).sum(-1))
-        vmask = _to_strided(align_vis.squeeze(-1))               # (T-1,N)
-        weight = _to_strided(torch.exp(-dist * temperature) * vmask[:, None, None, :])
+        # Distance→weights (t_groups,H,W,N)
+        diff  = align_xy[:, None, None, :, :] - grid[None, :, :, None, :]    # (t_groups,H,W,N,2)
+        dist  = (diff * diff).sum(-1)                                        # (t_groups,H,W,N)
+        weight = torch.exp(-dist * temperature) * align_vis.squeeze(-1)[:, None, None, :]  # (t_groups,H,W,N)
 
-        # Top-k over tracks
         k = int(min(max(1, topk), weight.shape[-1]))
-        vert_weight, vert_index = torch.topk(weight, k=k, dim=-1)  # (T-1,H,W,k)
-        vert_weight = _to_strided(vert_weight)
-        vert_index  = _to_strided(vert_index)
+        vert_weight, vert_index = torch.topk(weight, k=k, dim=-1)            # (t_groups,H,W,k)
 
-    # === Point-feature extraction on frame 0 ===
-    x0_in = _to_strided(vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1])       # (1,C,H,W)
-    grid_ = _to_strided(xy_n[:, :1].reshape(1, 1, N, 2).to(x0_in.dtype))   # (1,1,NN,2)
+    # Sample point features from frame 0 latent (C=vae_divide[1]) at normalized coords of t=0
+    x0_in = vid[vae_divide[0]:].permute(1, 0, 2, 3)[:1]           # (1,C,H,W)
+    g     = xy_n[:, :1].reshape(1, 1, N, 2).to(x0_in.dtype)       # (1,1,N,2)
+    pt = F.grid_sample(x0_in, g, mode="bilinear", padding_mode="zeros", align_corners=False)  # (1,C,1,N)
+    pt = pt.contiguous()
+    point_feature = pt[0, :, 0, :].transpose(0, 1).contiguous()   # (N,C)
 
-    try:
-        pt = F.grid_sample(
-            x0_in, grid_,
-            mode="bilinear", padding_mode="zeros", align_corners=False
-        )  # -> (1, C, 1, N)
-        pt = _to_strided(pt)
-        # (1,C,1,N) -> (C,N) -> (N,C) without .t() / permute(1,0)
-        point_feature = _to_strided(pt[0, :, 0, :]).transpose(0, 1)         # (N, C)
-    except Exception:
-        # Fallback: NN gather
-        x0 = _to_strided(vid[vae_divide[0]:, 0])   # (C,H,W)
-        xy0 = _to_strided(xy_n[:, 0, :, :])        # (B=1,N,2)
-        if xy0.dim() == 3 and xy0.shape[0] == 1:
-            xy0 = xy0[0]                           # (N,2)
-        px = ((xy0[..., 0] + 1) * 0.5) * (W - 1)
-        py = ((xy0[..., 1] + 1) * 0.5) * (H - 1)
-        px = torch.clamp(px.round().long(), 0, W - 1)
-        py = torch.clamp(py.round().long(), 0, H - 1)
-        point_feature = _to_strided(x0[:, py, px].transpose(0, 1))          # (N,C)
+    # Merge & blend (keep original outputs for 81 frames)
+    out_feature = merge_final(point_feature, vert_weight, vert_index).permute(3, 0, 1, 2)  # (C,T-1,H,W)
+    out_weight  = vert_weight.sum(-1)                                                      # (T-1,H,W)
+    mix_feature = out_feature + vid[vae_divide[0]:, 1:] * (1 - out_weight.clamp(0, 1))
+    out_feature_full = torch.cat([vid[vae_divide[0]:, :1], mix_feature], dim=1)            # (C,T,H,W)
+    out_mask_full    = torch.cat([torch.ones_like(out_weight[:1]), out_weight], dim=0)     # (T,H,W)
 
-    # Merge and blend
-    out_feature = _to_strided(merge_final(point_feature, vert_weight, vert_index).permute(3, 0, 1, 2))  # (C,T-1,H,W)
-    out_weight  = _to_strided(vert_weight.sum(-1))                                                      # (T-1,H,W)
-
-    mix_feature      = _to_strided(out_feature + vid[vae_divide[0]:, 1:] * (1 - out_weight.clamp(0, 1)))
-    out_feature_full = _to_strided(torch.cat([vid[vae_divide[0]:, :1], mix_feature], dim=1))            # (C,T,H,W)
-    out_mask_full    = _to_strided(torch.cat([torch.ones_like(out_weight[:1]), out_weight], dim=0))     # (T,H,W)
-
-    return torch.cat(
-        [out_mask_full[None].expand(vae_divide[0], -1, -1, -1), out_feature_full],
-        dim=0
-    )
-
-
+    return torch.cat([out_mask_full[None].expand(vae_divide[0], -1, -1, -1), out_feature_full], dim=0)

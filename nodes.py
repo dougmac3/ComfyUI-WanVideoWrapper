@@ -1949,18 +1949,51 @@ class WanVideoSampler:
 
             #ATI tracks
             if transformer_options is not None:
-                ATI_tracks = transformer_options.get("ati_tracks", None)
-                if ATI_tracks is not None:
-                    from .ATI import motion_patch as ati_motion
-                    topk = transformer_options.get("ati_topk", 2)
-                    temperature = transformer_options.get("ati_temperature", 220.0)
-                    ati_start_percent = transformer_options.get("ati_start_percent", 0.0)
-                    ati_end_percent = transformer_options.get("ati_end_percent", 1.0)
-                    image_cond_ati = ati_motion.patch_motion_tether(
-                        ATI_tracks.to(image_cond.device, image_cond.dtype),
-                        image_cond, topk=topk, temperature=temperature
-                    )
-                    log.info(f"ATI tracks shape: {ATI_tracks.shape}")
+    ATI_tracks = transformer_options.get("ati_tracks", None)
+    if ATI_tracks is not None:
+        from .ATI import motion_patch as ati_motion
+
+            # Read options (kept for compatibility/logging)
+            topk = transformer_options.get("ati_topk", 2)
+            temperature = transformer_options.get("ati_temperature", 220.0)
+            ati_start_percent = transformer_options.get("ati_start_percent", 0.0)
+            ati_end_percent = transformer_options.get("ati_end_percent", 1.0)
+
+            # ---- Normalize tracks & validate time ----
+            ATI_tracks = ATI_tracks.to(image_cond.device, image_cond.dtype)
+
+            # Ensure batch dim present: (B,T,N,4)
+            if ATI_tracks.dim() == 3:
+                ATI_tracks = ATI_tracks.unsqueeze(0)  # -> (1,T,N,4)
+
+            ATI_tracks = ATI_tracks.contiguous()
+            B, T_tracks, N, C4 = ATI_tracks.shape
+
+            # Video latent time from image_cond (C_total, T, H, W)
+            _, T_vid, _, _ = image_cond.shape
+
+            # Enforce the contract: tracks time must match latent time
+            if T_tracks != T_vid:
+                raise ValueError(
+                    f"ATI tracks T ({T_tracks}) must equal video T ({T_vid}). "
+                    f"If you’re feeding 81 pixel frames, latent T should be 21 ((81-1)//4 + 1)."
+                )
+
+            # ---- Apply ATI motion patch (robust version) ----
+            # NOTE: we call patch_motion (not *_tether) to keep original behavior,
+            # and pass the same defaults the wrapper expects.
+            image_cond_ati = ati_motion.patch_motion(
+                ATI_tracks,
+                image_cond,
+                topk=topk,
+                temperature=temperature,
+                vae_divide=(4, 16),
+            )
+
+            log.info(
+                f"ATI tracks shape: {ATI_tracks.shape} | topk={topk} temp={temperature} "
+                f"range=({ati_start_percent},{ati_end_percent})"
+            )
             
             add_cond_latents = image_embeds.get("add_cond_latents", None)
             if add_cond_latents is not None:
