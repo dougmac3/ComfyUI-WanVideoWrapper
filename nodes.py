@@ -8,7 +8,13 @@ import copy
 from PIL import Image
 import hashlib
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from .ATI import motion_patch as ati_motion
+try:
+    from .ATI import motion_patch as _mp
+except Exception:
+    import importlib
+    _mp = importlib.import_module(
+        "custom_nodes.ComfyUI-WanVideoWrapper.ATI.motion_patch"
+    )
 
 from .wanvideo.modules.model import rope_params
 from .custom_linear import remove_lora_from_module, set_lora_params
@@ -48,13 +54,7 @@ except:
     pass
 
 # add this with the other imports in ComfyUI-WanVideoWrapper/nodes.py
-try:
-    from .ATI import motion_patch as _mp
-except Exception:
-    import importlib
-    _mp = importlib.import_module(
-        "custom_nodes.ComfyUI-WanVideoWrapper.ATI.motion_patch"
-    )
+
 
 
 class MetaParameter(torch.nn.Parameter):
