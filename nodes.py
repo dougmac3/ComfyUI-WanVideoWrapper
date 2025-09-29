@@ -1966,9 +1966,6 @@ class WanVideoSampler:
                     ati_start_percent = transformer_options.get("ati_start_percent", 0.0)
                     ati_end_percent   = transformer_options.get("ati_end_percent", 1.0)
 
-                    # Ensure tracks/device/dtype + **time align** to video T
-                    import torch
-                    import torch.nn.functional as F
 
                     ATI_tracks = ATI_tracks.to(image_cond.device, image_cond.dtype)
 
