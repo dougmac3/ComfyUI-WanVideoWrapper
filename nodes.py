@@ -97,17 +97,31 @@ def offload_transformer(transformer):
 
 def _resample_tracks_time(tracks, target_T):
     """
-    tracks: (B, T, N, 4)   4 = [mask_or_dummy, x, y, visible]
-    returns: (B, target_T, N, 4)
+    Input  tracks: (B, T, N, 4) where 4 = [mask_or_dummy, x, y, visible]
+    Output        : (B, target_T, N, 4)
     """
     import torch
     import torch.nn.functional as F
+
+    # Coerce to tensor if we ever get a Python list/np array
+    if not isinstance(tracks, torch.Tensor):
+        tracks = torch.tensor(tracks)
+
     assert tracks.dim() == 4 and tracks.size(-1) == 4, f"expected (B,T,N,4), got {tuple(tracks.shape)}"
-    B, T_in, N, C = tracks.shape
-    # reshape to (B*N, C, T) so 'linear' (1D) is valid
-    x = tracks.permute(0, 2, 3, 1).contiguous().reshape(B * N, C, T_in)    # (B*N, 4, T_in)
-    x = F.interpolate(x, size=target_T, mode="linear", align_corners=False) # (B*N, 4, target_T)
-    out = x.reshape(B, N, C, target_T).permute(0, 3, 1, 2).contiguous()     # (B, target_T, N, 4)
+
+    B, T_in, N, C = tracks.shape  # C must be 4
+
+    # (B, T, N, 4) -> (B*N, 4, T)  [3-D so 'linear' is valid]
+    x = tracks.permute(0, 2, 3, 1).contiguous().reshape(B * N, C, T_in).to(torch.float32)
+
+    # 1D interpolation over time
+    x = F.interpolate(x, size=target_T, mode="linear", align_corners=False)  # (B*N, 4, target_T)
+
+    # Back to (B, target_T, N, 4)
+    out = x.reshape(B, N, C, target_T).permute(0, 3, 1, 2).contiguous()
+    # Keep original dtype if it wasn't float32
+    if out.dtype != tracks.dtype:
+        out = out.to(tracks.dtype)
     return out
 
 class WanVideoEnhanceAVideo:
@@ -1971,24 +1985,22 @@ class WanVideoSampler:
                     topk = transformer_options.get("ati_topk", 2)
                     temperature = transformer_options.get("ati_temperature", 220.0)
                     ati_start_percent = transformer_options.get("ati_start_percent", 0.0)
-                    ati_end_percent   = transformer_options.get("ati_end_percent",   1.0)
+                    ati_end_percent   = transformer_options.get("ati_end_percent", 1.0)
 
-                    # image_cond is (C_all, T, H, W); use its T as the canonical video length
+                    # image_cond is (C_all, T, H, W) — use its T as canonical video length
                     T_video = int(image_cond.shape[1])
 
-                    # AE sometimes sends T != T_video; resample tracks along time only
+                    # Resample tracks ALONG TIME ONLY so (B,T,N,4) matches video T
                     if ATI_tracks.shape[1] != T_video:
                         ATI_tracks = _resample_tracks_time(ATI_tracks, T_video)
 
-                    # now apply motion patch (uses first 16 mask channels convention internally)
-                    image_cond_ati = ati_motion.patch_motion(
+                    # Apply ATI
+                    image_cond = ati_motion.patch_motion(
                         ATI_tracks.to(image_cond.device, image_cond.dtype),
                         image_cond,
                         topk=topk,
                         temperature=temperature
                     )
-                    # replace image_cond with ATI-augmented conditioning
-                    image_cond = image_cond_ati
 
         else: #t2v
             target_shape = image_embeds.get("target_shape", None)
