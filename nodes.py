@@ -2697,9 +2697,8 @@ class WanVideoSampler:
                                 patcher = apply_lora(patcher, device, device, low_mem_load=False, control_lora=True)
                                 patcher.model.is_patched = True
                                 
-               elif ATI_tracks is not None and image_cond_ati is not None and ((ati_start_percent <= current_step_percentage <= ati_end_percent) or 
-                            (ati_end_percent > 0 and idx == 0 and current_step_percentage >= ati_start_percent)):
-                                image_cond_input = image_cond_ati.to(z)
+                elif ATI_tracks is not None and image_cond_ati is not None and ((ati_start_percent <= current_step_percentage <= ati_end_percent) or (ati_end_percent > 0 and idx == 0 and current_step_percentage >= ati_start_percent)):
+                    image_cond_input = image_cond_ati.to(z)
                 elif image_cond is not None:
                     if reverse_time: # Flip the image condition
                         image_cond_input = torch.cat([
