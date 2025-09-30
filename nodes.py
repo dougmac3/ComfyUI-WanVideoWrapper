@@ -2117,6 +2117,7 @@ class WanVideoSampler:
             phantom_end_percent = image_embeds.get("phantom_end_percent", 1.0)
 
         latent_video_length = image_cond.shape[1]
+        noise = None  # Initialize to prevent reference errors
 
         # Initialize FreeInit filter if enabled
         freq_filter = None
@@ -2326,6 +2327,14 @@ class WanVideoSampler:
         # vid2vid
         noise_mask=original_image=None
         if samples is not None and not multitalk_sampling:
+
+            if noise is None:
+                # Infer dimensions from image_cond
+                C = image_cond.shape[0] // 2 if image_cond.shape[0] > 16 else 16
+                T = latent_video_length
+                H = image_cond.shape[2]
+                W = image_cond.shape[3]
+                noise = torch.randn(C, T, H, W, dtype=torch.float32, device=torch.device("cpu"), generator=seed_g)
             saved_generator_state = samples.get("generator_state", None)
             if saved_generator_state is not None:
                 seed_g.set_state(saved_generator_state)
