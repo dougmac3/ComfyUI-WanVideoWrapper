@@ -2117,34 +2117,31 @@ class WanVideoSampler:
             phantom_end_percent = image_embeds.get("phantom_end_percent", 1.0)
 
         latent_video_length = image_cond.shape[1]
-        if image_cond is not None:
-        # For I2V, we need to create noise matching the latent dimensions
-        # image_cond shape: [20, 21, 66, 116] means [C, T, H, W]
-        # First 4 channels are typically mask, remaining are image features
-        noise_C = 16  # Standard latent channels (48 for 5b models)
-        if is_5b:
-            noise_C = 48
-        
-        # Get spatial dimensions from image_cond
-        noise_H = image_cond.shape[2]  # 66 in your case
-        noise_W = image_cond.shape[3]  # 116 in your case
-        
-        # Create the noise tensor
-        noise = torch.randn(
-            noise_C,
-            latent_video_length,  # 21 frames
-            noise_H,
-            noise_W,
-            dtype=torch.float32,
-            device=torch.device("cpu"),
-            generator=seed_g
-        )
-        
-        # Also calculate seq_len since it's needed later
-        seq_len = math.ceil((noise_H * noise_W) / 4 * latent_video_length)
-
-        # Calculate sequence length for later use
-        seq_len = math.ceil((H * W) / 4 * latent_video_length)
+            if image_cond is not None:
+            # For I2V, we need to create noise matching the latent dimensions
+            # image_cond shape: [20, 21, 66, 116] means [C, T, H, W]
+            # First 4 channels are typically mask, remaining are image features
+            noise_C = 16  # Standard latent channels (48 for 5b models)
+            if is_5b:
+                noise_C = 48
+            
+            # Get spatial dimensions from image_cond
+            noise_H = image_cond.shape[2]  # 66 in your case
+            noise_W = image_cond.shape[3]  # 116 in your case
+            
+            # Create the noise tensor
+            noise = torch.randn(
+                noise_C,
+                latent_video_length,  # 21 frames
+                noise_H,
+                noise_W,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                generator=seed_g
+            )
+            
+            # Also calculate seq_len since it's needed later
+            seq_len = math.ceil((noise_H * noise_W) / 4 * latent_video_length)
 
         # Initialize FreeInit filter if enabled
         freq_filter = None
