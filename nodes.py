@@ -1979,6 +1979,7 @@ class WanVideoSampler:
             #ATI tracks
             # ---- ATI integration (drop-in replacement) ----
             if transformer_options is not None:
+                image_cond_ati = None
                 ATI_tracks = transformer_options.get("ati_tracks", None)
                 if ATI_tracks is not None:
                     from .ATI import motion_patch as ati_motion
