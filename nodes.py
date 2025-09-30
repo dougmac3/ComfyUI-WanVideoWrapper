@@ -2143,6 +2143,8 @@ class WanVideoSampler:
             # Also calculate seq_len since it's needed later
             seq_len = math.ceil((noise_H * noise_W) / 4 * latent_video_length)
 
+            control_embeds = image_embeds.get("control_embeds", None)
+
         # Initialize FreeInit filter if enabled
         freq_filter = None
         if freeinit_args is not None:
