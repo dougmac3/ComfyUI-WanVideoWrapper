@@ -148,6 +148,9 @@ class WanVideoATITracks:
             "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Start percent of the steps to apply ATI"}),
             "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "End percent of the steps to apply ATI"}),
         },
+        "optional": {
+            "target_frames": ("INT", {"default": 81, "min": 5, "max": 241, "step": 4, "tooltip": "Target frame count. 81=legacy (downsample 121→81), 121=extended (skip downsampling, use with RIFLEx)"}),
+        },
         }
 
     RETURN_TYPES = ("WANVIDEOMODEL",)
@@ -155,7 +158,7 @@ class WanVideoATITracks:
     FUNCTION = "patchmodel"
     CATEGORY = "WanVideoWrapper"
 
-    def patchmodel(self, model, tracks, width, height, temperature, topk, start_percent, end_percent):
+    def patchmodel(self, model, tracks, width, height, temperature, topk, start_percent, end_percent, target_frames=81):
         tracks_data = parse_json_tracks(tracks)
         arrs = []
         for track in tracks_data:
@@ -164,7 +167,7 @@ class WanVideoATITracks:
 
         tracks_np = np.stack(arrs, axis=0)
 
-        processed_tracks = process_tracks(tracks_np, (width, height))
+        processed_tracks = process_tracks(tracks_np, (width, height), target_frames=target_frames)
 
         patcher = model.clone()
         patcher.model_options["transformer_options"]["ati_tracks"] = processed_tracks.unsqueeze(0)
