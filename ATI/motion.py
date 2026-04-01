@@ -16,15 +16,17 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-def process_tracks(tracks_np: np.ndarray, frame_size: Tuple[int, int], quant_multi: int = 8, **kwargs):
+def process_tracks(tracks_np: np.ndarray, frame_size: Tuple[int, int], quant_multi: int = 8, target_frames: int = 81, **kwargs):
     # tracks: shape [t, h, w, 3] => samples align with 24 fps, model trained with 16 fps.
     # frame_size: tuple (W, H)
+    # target_frames: 81 (default, legacy) or 121 (extended — skip downsampling)
 
     tracks = torch.from_numpy(tracks_np).float()
-    
+
     if tracks.shape[1] == 121:
         tracks = torch.permute(tracks, (1, 0, 2, 3))
-    
+
+    T_in = tracks.shape[0]  # 121 (padded input length)
     tracks, visibles = tracks[..., :2], tracks[..., 2:3]
     short_edge = min(*frame_size)
 
@@ -33,9 +35,15 @@ def process_tracks(tracks_np: np.ndarray, frame_size: Tuple[int, int], quant_mul
 
     visibles = visibles * 2 - 1
 
-    trange = torch.linspace(-1, 1, tracks.shape[0]).view(-1, 1, 1, 1).expand(*visibles.shape)
-    
-    out_ = torch.cat([trange, tracks, visibles], dim=-1).view(121, -1, 4)
+    trange = torch.linspace(-1, 1, T_in).view(-1, 1, 1, 1).expand(*visibles.shape)
+
+    out_ = torch.cat([trange, tracks, visibles], dim=-1).view(T_in, -1, 4)
+
+    if target_frames >= T_in:
+        # Extended mode: skip downsampling, return all 121 frames
+        return out_
+
+    # Legacy 81-frame mode: downsample 121→81
     out_0 = out_[:1]
     out_l = out_[1:] # 121 => 120 | 1
     out_l = torch.repeat_interleave(out_l, 2, dim=0)[1::3]  # 120 => 240 => 80
