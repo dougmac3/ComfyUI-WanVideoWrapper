@@ -29,6 +29,11 @@ script_directory = os.path.dirname(os.path.abspath(__file__))
 device = mm.get_torch_device()
 offload_device = mm.unet_offload_device()
 
+# Tether: cache loaded model between prompts to avoid mm.unload_all_models() + full reload.
+# Cache key = (model name, precision, device, quantization, attention, lora config).
+# Any parameter change triggers a cache miss and normal full reload.
+_wan_model_cache = {"key": None, "patcher": None}
+
 try:
     from server import PromptServer
 except:
@@ -997,6 +1002,24 @@ class WanVideoModelLoader:
             merge_loras = any(l.get("merge_loras", True) for l in lora)
             lora_low_mem_load = any(l.get("low_mem_load", False) for l in lora)
 
+        # Tether: check model cache — skip unload/reload if same config
+        global _wan_model_cache
+        _lora_key = None
+        if lora is not None:
+            _lora_key = tuple((l.get("path", ""), l.get("strength", 0), l.get("name", ""),
+                               l.get("merge_loras", True)) for l in lora)
+        _cache_key = (model, base_precision, load_device, quantization, attention_mode, _lora_key)
+
+        if _wan_model_cache["key"] == _cache_key and _wan_model_cache["patcher"] is not None:
+            log.info("Model cache HIT — reusing loaded model, skipping unload/reload")
+            patcher = _wan_model_cache["patcher"]
+            for m in mm.current_loaded_models:
+                if m._model() == patcher:
+                    mm.current_loaded_models.remove(m)
+            return (patcher,)
+
+        log.info("Model cache MISS — full load")
+
         transformer = None
         mm.unload_all_models()
         mm.cleanup_models()
@@ -1461,6 +1484,12 @@ class WanVideoModelLoader:
         for model in mm.current_loaded_models:
             if model._model() == patcher:
                 mm.current_loaded_models.remove(model)
+
+        # Tether: store in cache for next prompt
+        _wan_model_cache["key"] = _cache_key
+        _wan_model_cache["patcher"] = patcher
+        log.info("Model cached for reuse on next prompt")
+
         return (patcher,)
     
 # class WanVideoSaveModel:
