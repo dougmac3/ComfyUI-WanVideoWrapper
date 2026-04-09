@@ -1011,7 +1011,11 @@ class WanVideoModelLoader:
         _cache_key = (model, base_precision, load_device, quantization, attention_mode, _lora_key)
 
         if _wan_model_cache["key"] == _cache_key and _wan_model_cache["patcher"] is not None:
-            log.info("Model cache HIT — reusing loaded model, skipping unload/reload")
+            log.info("Model cache HIT — reusing loaded model, skipping disk reload + LoRA patching")
+            # Still free GPU memory (T5/VAE/CLIP from previous prompt) so sampler has room
+            mm.unload_all_models()
+            mm.cleanup_models()
+            mm.soft_empty_cache()
             patcher = _wan_model_cache["patcher"]
             for m in mm.current_loaded_models:
                 if m._model() == patcher:
