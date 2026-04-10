@@ -1006,7 +1006,7 @@ class WanVideoModelLoader:
         global _wan_model_cache
         _lora_key = None
         if lora is not None:
-            _lora_key = tuple((l.get("path", ""), l.get("strength", 0), l.get("name", ""),
+            _lora_key = tuple((os.path.basename(l.get("path", "")), l.get("strength", 0), l.get("name", ""),
                                l.get("merge_loras", True)) for l in lora)
         _cache_key = (model, base_precision, load_device, quantization, attention_mode, _lora_key)
 
